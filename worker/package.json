@@ -1,0 +1,13 @@
+{
+  "name": "lifeboat-worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test",
+    "fleet:bootstrap-kv": "wrangler kv namespace create lifeboat-sites --binding SITES --update-config"
+  },
+  "devDependencies": {
+    "wrangler": "4.128.0"
+  }
+}

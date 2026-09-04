@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "sites": [
+    {
+      "canonicalHost": "example.com",
+      "origin": "https://wp-origin.example.net",
+      "aliases": [
+        "www.example.com"
+      ]
+    },
+    {
+      "canonicalHost": "news.example.com",
+      "origin": "https://news-origin.example.net",
+      "prefix": "sites/news.example.com"
+    }
+  ]
+}

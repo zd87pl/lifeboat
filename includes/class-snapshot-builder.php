@@ -436,14 +436,17 @@ final class Snapshot_Builder {
 			$this->store_404();
 			$job      = $this->job;
 			$st       = $job['stats'];
-			$counts   = self::counts( $job['objects'] );
-			$attempts = $st['uploaded'] + $st['copied'] + $st['failed'];
-			$err_pct  = $attempts > 0 ? $st['failed'] * 100 / $attempts : 100.0;
-			$home_ok  = isset( $job['objects']['index.html'] ) && 'page' === $job['objects']['index.html']['kind'];
-			$ok       = $home_ok && 0 === $st['failed_pages'] && $err_pct <= (float) $this->s['max_error_pct'];
-			$why      = '';
+			$counts      = self::counts( $job['objects'] );
+			$attempts    = $st['uploaded'] + $st['copied'] + $st['failed'];
+			$err_pct     = $attempts > 0 ? $st['failed'] * 100 / $attempts : 100.0;
+			$home_ok     = isset( $job['objects']['index.html'] ) && 'page' === $job['objects']['index.html']['kind'];
+			$not_found_ok = isset( $job['objects']['__404.html'] ) && 'system' === $job['objects']['__404.html']['kind'];
+			$ok          = $home_ok && $not_found_ok && 0 === $st['failed_pages'] && $err_pct <= (float) $this->s['max_error_pct'];
+			$why         = '';
 			if ( ! $home_ok ) {
 				$why = 'the home page is missing from the snapshot';
+			} elseif ( ! $not_found_ok ) {
+				$why = 'the 404 page is missing from the snapshot';
 			} elseif ( $st['failed_pages'] > 0 ) {
 				$why = "{$st['failed_pages']} page upload(s) failed";
 			} elseif ( ! $ok ) {
@@ -495,26 +498,38 @@ final class Snapshot_Builder {
 
 		// Incremental: merge into the live manifest, apply deletions, refresh the pointer's timestamp.
 		$objects = $job['objects'] + ( $this->prev['objects'] ?? [] );
+		$deleted = 0;
 		foreach ( $job['deletes'] as $path ) {
 			$key = Keys::path_to_key( $path );
 			$r   = $this->r2->delete( $job['prefix'] . '/' . $key );
 			if ( is_wp_error( $r ) ) {
 				$this->error( "delete $key: " . $r->get_error_message() );
+				$this->job['stats']['failed']++;
+				continue;
 			}
 			unset( $objects[ $key ] );
+			$deleted++;
 		}
 		$counts = self::counts( $objects );
-		$r      = $this->r2->put( $job['prefix'] . '/manifest.json', self::json( $this->manifest( $objects, $counts, (int) ( $this->prev['created'] ?? $job['started'] ), true ) ), 'application/json' );
-		$ok     = ! is_wp_error( $r ) && 0 === $st['failed_pages'];
+		$ok     = 0 === $this->job['stats']['failed'] && 0 === $this->job['stats']['failed_pages'];
+		$r      = $ok
+			? $this->r2->put( $job['prefix'] . '/manifest.json', self::json( $this->manifest( $objects, $counts, (int) ( $this->prev['created'] ?? $job['started'] ), true ) ), 'application/json' )
+			: true;
 		if ( is_wp_error( $r ) ) {
 			$this->error( 'manifest update failed: ' . $r->get_error_message() );
-		} else {
-			$this->write_pointer( $counts );
-			$last = self::last_snapshot();
-			if ( $last ) {
-				$last['updated_at'] = time();
-				$last['counts']     = $counts;
-				update_option( self::LAST_OPTION, $last, false );
+			$ok = false;
+		} elseif ( $ok ) {
+			$r = $this->write_pointer( $counts );
+			if ( is_wp_error( $r ) ) {
+				$this->error( 'pointer update failed: ' . $r->get_error_message() );
+				$ok = false;
+			} else {
+				$last = self::last_snapshot();
+				if ( $last ) {
+					$last['updated_at'] = time();
+					$last['counts']     = $counts;
+					update_option( self::LAST_OPTION, $last, false );
+				}
 			}
 		}
 		return $this->end_job(
@@ -524,8 +539,8 @@ final class Snapshot_Builder {
 				$job['id'],
 				$st['uploaded'],
 				$st['skipped'],
-				count( $job['deletes'] ),
-				$st['failed']
+				$deleted,
+				$this->job['stats']['failed']
 			)
 		);
 	}

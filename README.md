@@ -1,20 +1,62 @@
 # Lifeboat
 
-WordPress plugin that keeps a static snapshot of your site in Cloudflare R2 so a Cloudflare Worker can serve it when the origin (GCP / Azure / AWS, or WordPress itself) is down.
+Lifeboat keeps a static snapshot of a WordPress site in Cloudflare R2 and serves it from a Cloudflare Worker when the origin (GCP / Azure / AWS, or WordPress itself) is down.
 
-The plugin only **builds and pushes** snapshots. Failover is decided at the edge by a Worker that reads the same bucket — the contract is documented below so the Worker can be written independently.
+This repository includes the complete path: the WordPress plugin builds and pushes snapshots, [`worker/`](worker/) performs origin-first edge failover, [`demo/`](demo/) proves the live-to-offline flow locally, and [`fleet/`](fleet/) compiles hostname routing for a large rollout.
+
+```text
+visitor ──> Worker ──> healthy WordPress origin
+                 └──> R2 snapshot on timeout or 5xx
+
+WP-CLI/plugin crawler ──> private origin ──> versioned R2 promotion
+```
 
 ## What it does
 
 - Enumerates URLs from WordPress internals (posts, pages, CPTs, terms, authors, archives, feed, sitemaps) and discovers the rest by crawling links.
-- Fetches everything through a **loopback to the origin** (never through Cloudflare) as an anonymous visitor.
+- Fetches as an anonymous visitor through a separately configured **direct origin/loopback**, avoiding the public Worker; a fallback-header guard aborts a misrouted build.
 - Uploads pages, assets and redirects to R2 under a versioned prefix; unchanged objects are **server-side copied** from the previous snapshot instead of re-uploaded (sha256 manifest diff).
 - Writes `current.json` **last**, so the Worker never sees a half-built snapshot. A build that fails its sanity checks is never promoted — the previous snapshot stays live.
 - Runs full rebuilds on a schedule (WP-CLI from system cron recommended) and **incremental updates** a couple of minutes after a post is published, updated, trashed or deleted.
 - Keeps the last N snapshots and prunes the rest.
-- Exposes `GET /wp-json/lifeboat/v1/health` for the Worker's circuit-breaker probe.
+- Exposes `GET /wp-json/lifeboat/v1/health` for monitoring or a durable circuit-breaker integration.
 
 Requirements: WordPress 6.2+, PHP 8.0+, pretty permalinks, an R2 bucket.
+
+## End-to-end quickstart
+
+The local demo requires Docker Compose, curl, and Node.js 22+ with npm. It uses stock MariaDB, WordPress, WP-CLI and `cloudflared` images, deploys the included Worker, creates sample content, promotes a snapshot, proves the healthy origin, stops WordPress, and proves the R2 fallback.
+
+```sh
+cp demo/.env.example demo/.env
+# Fill in the Cloudflare Worker token and R2 S3 credentials; use bucket lifeboat-demo.
+./demo/demo.sh
+```
+
+A successful run reports a live HTTP 200 with no `X-Lifeboat` header, then an offline HTTP 200 with `X-Lifeboat: <snapshot-id>`. WordPress is intentionally left stopped:
+
+```sh
+./demo/demo.sh restore   # return to the live origin
+./demo/demo.sh cleanup   # remove containers, preserving local data
+```
+
+See [`demo/README.md`](demo/README.md) for credentials and lifecycle details. The random `trycloudflare.com` Quick Tunnel is development-only; production should use a stable, access-controlled origin address or named tunnel.
+
+The demo disables incremental updates and plugin-managed WP-Cron scheduling, so its proof uses only immutable, versioned full promotions. Incremental refreshes remain available for normal installations.
+
+## Live presentation dashboard
+
+[`showcase/`](showcase/) adds a self-explanatory React control room for demos. It sends a public probe every 1.25 seconds, visualizes the active Visitor → Cloudflare → WordPress/R2 route, and displays the raw `HTTP`, `CF-Ray`, origin-health, and `X-Lifeboat` evidence behind every claim.
+
+After the end-to-end demo has been provisioned once:
+
+```sh
+cd showcase
+npm ci
+LIFEBOAT_DOCKER_CONTEXT=desktop-linux npm run present
+```
+
+The outage switch is localhost-only and can start or stop only the demo's fixed `wordpress` service. The hosted audience view remains live but read-only. See [`showcase/README.md`](showcase/README.md) for the presentation script and security boundary.
 
 ## Install
 
@@ -33,6 +75,7 @@ define( 'LIFEBOAT_ORIGIN_URL',           'https://127.0.0.1' ); // loopback base
 
 4. Verify: `wp lifeboat test-r2`, then `wp lifeboat urls` to see the seed list, then `wp lifeboat build`.
 5. `wp lifeboat verify` reads `current.json` back and reports what the Worker would serve.
+6. Deploy [`worker/`](worker/) with its `SNAPSHOTS` R2 binding pointed at the same bucket. Use `DEFAULT_HOST`/`DEFAULT_ORIGIN` for one site, or the `SITES` KV inventory below for a fleet, then attach the public hostname to the Worker.
 
 ## Loopback (LIFEBOAT_ORIGIN_URL)
 
@@ -70,7 +113,9 @@ Only one job runs at a time (DB-backed lock, safe across nodes). Job state lives
 ## Promotion rules
 
 A full build is promoted only if:
+
 - `index.html` (the home page) was captured as a page,
+- `__404.html` was captured from a real HTML 404 response,
 - no page upload failed,
 - failed uploads are at or below "Max failed uploads (%)" (default 1%).
 
@@ -103,7 +148,7 @@ Alert on **staleness**, not just build failures: the dashboard warns when the li
 }
 ```
 
-Incremental updates write into the current prefix in place and rewrite `manifest.json` and `current.json` (same `snapshot_id`, new `updated_at`).
+Full builds create a new versioned prefix and atomically promote it by writing `current.json` last. Incremental updates instead mutate the current prefix in place, then rewrite `manifest.json` and `current.json` with the same `snapshot_id` and a new `updated_at`.
 
 ### Key mapping
 
@@ -121,19 +166,38 @@ Serve the object with its stored `Content-Type` (httpMetadata). On a miss, serve
 
 ### Redirects
 
-The origin's redirects (e.g. old slugs, `/about` → `/about/`) are stored as small HTML meta-refresh objects with custom metadata `lifeboat-redirect` = absolute target. The Worker should return a `301 Location: <target>` when that metadata is present.
+When an origin redirect resolves to a different snapshot key or another host, the plugin stores a small HTML fallback object with custom metadata `lifeboat-redirect` = the absolute target. The included Worker normalizes that stored redirect to `301 Location: <target>`. Same-key spelling variants such as `/about` and `/about/` share `about/index.html`, so Lifeboat does not persist a redundant trailing-slash redirect.
 
 ### Headers the Worker must honour
 
-- Requests carrying `X-Lifeboat-Crawl: <secret>` come from the plugin's crawler (only relevant if the crawler is not on loopback). Pass them straight to the origin and never answer them from the snapshot. The secret is generated on activation and shown nowhere by default; read it with `wp option get lifeboat_settings`.
+- The plugin crawler sends `X-Lifeboat-Crawl: <secret>`. The included Worker treats it as a bypass **only** when its `CRAWL_SECRET` binding is configured and the value matches exactly; an arbitrary or merely present header has no effect. This is only needed when a crawler cannot use a private origin. The per-site secret is generated on activation and can be read with `wp option get lifeboat_settings`.
 - Responses served from the snapshot must carry `X-Lifeboat: <snapshot_id>`. The crawler aborts a build if it sees this header, which prevents snapshotting the snapshot.
-- Health probe: `GET /wp-json/lifeboat/v1/health` returns 200 (`{"ok":true,...}`) or 503, with `Cache-Control: no-store`. `/wp-json/*` is pass-through in the Worker.
+- Health endpoint: `GET /wp-json/lifeboat/v1/health` returns 200 (`{"ok":true,...}`) or 503, with `Cache-Control: no-store`. `/wp-json/*` is pass-through in the Worker.
 
-### Recommended Worker behaviour (summary)
+### Included Worker behaviour
 
-- Pass through: non-GET/HEAD, `/wp-admin`, `/wp-login.php`, `/wp-json`, `/wp-cron.php`, requests with a `wordpress_logged_in_*` cookie, and crawler requests. If the origin is down for these, answer 503 with a "site is read-only right now" page and `Retry-After`.
-- Otherwise fetch the origin with a 5–8 s timeout. Status < 500 → pass through (real 404s stay 404). 5xx / 52x / 530 / timeout → serve from R2 with the mapping above, inject a small "showing a saved copy" banner via HTMLRewriter, disable forms.
-- Circuit breaker: an isolate-local trip (~30 s) plus a 1-minute Cron Trigger that probes the health endpoint and writes `up`/`down` to KV; while `down`, skip the origin fetch entirely. A `force_fallback` KV flag makes drills trivial.
+- Exact-host routing comes from `DEFAULT_HOST`/`DEFAULT_ORIGIN` for the single-site demo or the optional `SITES` KV binding for a fleet. Unknown hosts fail closed with a read-only 503.
+- The Worker fetches the origin with a 7 s default timeout. Status below 500 passes through unchanged, including real 404 responses. A 5xx, timeout, or transport error opens an isolate-local 30 s breaker and serves the promoted R2 snapshot.
+- Non-GET/HEAD, `/wp-admin`, `/wp-login.php`, `/wp-json`, `/wp-cron.php`, logged-in requests, and an exactly authenticated crawler request may reach the origin but never receive a public snapshot; an outage returns the read-only 503 page with `Retry-After`.
+- Snapshot HTML receives a saved-copy banner and disabled forms. Stored content metadata, HEAD requests, redirect metadata, and the captured 404 page are preserved.
+- A `force_fallback: true` site record skips the origin for controlled drills. The repository does not install a Cron Trigger or durable health state by default.
+
+## 100-site pattern
+
+Use one Worker, one R2 bucket, and one `SITES` KV namespace rather than one edge deployment per site. Every canonical hostname gets an exact KV record with its stable origin and a unique `sites/<canonical-host>` prefix; each WordPress installation is configured for that prefix.
+
+Validate the inventory, then install the pinned Worker dependencies and bootstrap its `SITES` KV binding as described in the fleet runbook:
+
+```sh
+cp fleet/sites.example.json fleet/sites.json
+node fleet/sync-sites.mjs --inventory fleet/sites.json          # dry run
+(cd worker && npm ci && npm run fleet:bootstrap-kv)              # one-time KV bootstrap
+node fleet/sync-sites.mjs --inventory fleet/sites.json \
+  --config worker/wrangler.jsonc \
+  --wrangler worker/node_modules/.bin/wrangler --apply          # reviewed write
+```
+
+The dry run validates isolation and emits deterministic, staggered six-hour cron suggestions. `fleet:bootstrap-kv` is an explicit one-time Cloudflare mutation: Wrangler creates the namespace and writes its non-secret real ID into `worker/wrangler.jsonc`; no placeholder ID is committed. Provision plugin constants through each site's secret manager, keep crawler traffic on a private origin, and attach production routes only after snapshots and records exist. R2 S3 write authorization is bucket-scoped rather than prefix-scoped, so a shared bucket trades simplicity for a fleet-wide write blast radius; split separate trust boundaries across buckets and Worker deployments. See [`fleet/README.md`](fleet/README.md).
 
 ## WP-CLI
 
@@ -161,7 +225,7 @@ wp lifeboat cancel                             discard the in-progress job
 
 ## Limits and notes
 
-- Query-string URLs are never snapshotted (search, `?p=`, `?replytocom=`…); the Worker should treat them as pass-through or map them to the query-less key.
+- Query-string URLs are never snapshotted (search, `?p=`, `?replytocom=`…). The included Worker sends the full query to a healthy origin, then ignores it only when mapping a failed request to the static key.
 - Assets larger than "Max object size" are skipped (bodies are held in memory; keep it below PHP's memory limit).
 - Incremental runs refresh pages and fetch **new** assets only; theme/plugin asset changes are picked up by the next full build. Customizer, theme switch and menu changes schedule a full rebuild automatically.
 - Objects in R2 are left in place on uninstall.

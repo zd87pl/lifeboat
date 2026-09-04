@@ -1,0 +1,104 @@
+name: ${COMPOSE_PROJECT_NAME:-lifeboat-demo}
+
+x-wordpress-environment: &wordpress-environment
+  WORDPRESS_DB_HOST: database:3306
+  WORDPRESS_DB_NAME: ${WORDPRESS_DB_NAME:-wordpress}
+  WORDPRESS_DB_USER: ${WORDPRESS_DB_USER:-wordpress}
+  WORDPRESS_DB_PASSWORD: ${WORDPRESS_DB_PASSWORD:-wordpress}
+  WP_PUBLIC_URL: ${WP_PUBLIC_URL:-http://localhost:8080}
+  LIFEBOAT_R2_ACCOUNT_ID: ${LIFEBOAT_R2_ACCOUNT_ID:-}
+  LIFEBOAT_R2_BUCKET: ${LIFEBOAT_R2_BUCKET:-lifeboat-demo}
+  LIFEBOAT_R2_ACCESS_KEY_ID: ${LIFEBOAT_R2_ACCESS_KEY_ID:-}
+  LIFEBOAT_R2_SECRET_ACCESS_KEY: ${LIFEBOAT_R2_SECRET_ACCESS_KEY:-}
+  LIFEBOAT_ORIGIN_URL: ${LIFEBOAT_ORIGIN_URL:-}
+  LIFEBOAT_PREFIX: ${LIFEBOAT_PREFIX:-}
+  WORDPRESS_CONFIG_EXTRA: |
+    /* Demo configuration is resolved at runtime, so secrets never enter wp-config.php. */
+    $$lifeboat_public_url = getenv( 'WP_PUBLIC_URL' );
+    if ( $$lifeboat_public_url ) {
+        define( 'WP_HOME', $$lifeboat_public_url );
+        define( 'WP_SITEURL', $$lifeboat_public_url );
+        $$lifeboat_public_parts = parse_url( $$lifeboat_public_url );
+        if ( ! empty( $$lifeboat_public_parts['host'] ) ) {
+            $$_SERVER['HTTP_HOST'] = $$lifeboat_public_parts['host'];
+            if ( ! empty( $$lifeboat_public_parts['port'] ) ) {
+                $$_SERVER['HTTP_HOST'] .= ':' . $$lifeboat_public_parts['port'];
+            }
+        }
+        $$lifeboat_public_host = parse_url( $$lifeboat_public_url, PHP_URL_HOST );
+        if ( $$lifeboat_public_host && isset( $$_SERVER['HTTP_X_FORWARDED_HOST'] ) && $$lifeboat_public_host === $$_SERVER['HTTP_X_FORWARDED_HOST'] ) {
+            $$_SERVER['HTTP_HOST'] = $$lifeboat_public_host;
+            $$_SERVER['SERVER_NAME'] = $$lifeboat_public_host;
+        }
+    }
+    define( 'LIFEBOAT_R2_ACCOUNT_ID', (string) getenv( 'LIFEBOAT_R2_ACCOUNT_ID' ) );
+    define( 'LIFEBOAT_R2_BUCKET', (string) getenv( 'LIFEBOAT_R2_BUCKET' ) );
+    define( 'LIFEBOAT_R2_ACCESS_KEY_ID', (string) getenv( 'LIFEBOAT_R2_ACCESS_KEY_ID' ) );
+    define( 'LIFEBOAT_R2_SECRET_ACCESS_KEY', (string) getenv( 'LIFEBOAT_R2_SECRET_ACCESS_KEY' ) );
+    define( 'LIFEBOAT_ORIGIN_URL', (string) getenv( 'LIFEBOAT_ORIGIN_URL' ) );
+    if ( getenv( 'LIFEBOAT_PREFIX' ) ) {
+        define( 'LIFEBOAT_PREFIX', (string) getenv( 'LIFEBOAT_PREFIX' ) );
+    }
+    define( 'DISABLE_WP_CRON', true );
+    if ( isset( $$_SERVER['HTTP_X_FORWARDED_PROTO'] ) && 'https' === $$_SERVER['HTTP_X_FORWARDED_PROTO'] ) {
+        $$_SERVER['HTTPS'] = 'on';
+    }
+
+services:
+  database:
+    image: mariadb:11.4
+    restart: unless-stopped
+    environment:
+      MARIADB_DATABASE: ${WORDPRESS_DB_NAME:-wordpress}
+      MARIADB_USER: ${WORDPRESS_DB_USER:-wordpress}
+      MARIADB_PASSWORD: ${WORDPRESS_DB_PASSWORD:-wordpress}
+      MARIADB_ROOT_PASSWORD: ${WORDPRESS_DB_ROOT_PASSWORD:-lifeboat-local-root}
+    volumes:
+      - database_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+  wordpress:
+    image: wordpress:latest
+    restart: unless-stopped
+    depends_on:
+      database:
+        condition: service_healthy
+    environment: *wordpress-environment
+    ports:
+      - "${WORDPRESS_BIND:-127.0.0.1}:${WORDPRESS_PORT:-8080}:80"
+    volumes:
+      - wordpress_data:/var/www/html
+      - ../lifeboat.php:/var/www/html/wp-content/plugins/lifeboat/lifeboat.php:ro
+      - ../uninstall.php:/var/www/html/wp-content/plugins/lifeboat/uninstall.php:ro
+      - ../includes:/var/www/html/wp-content/plugins/lifeboat/includes:ro
+
+  cli:
+    image: wordpress:cli
+    profiles: ["tools"]
+    depends_on:
+      database:
+        condition: service_healthy
+    user: "33:33"
+    working_dir: /var/www/html
+    entrypoint: ["wp"]
+    environment: *wordpress-environment
+    volumes:
+      - wordpress_data:/var/www/html
+      - ../lifeboat.php:/var/www/html/wp-content/plugins/lifeboat/lifeboat.php:ro
+      - ../uninstall.php:/var/www/html/wp-content/plugins/lifeboat/uninstall.php:ro
+      - ../includes:/var/www/html/wp-content/plugins/lifeboat/includes:ro
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    depends_on:
+      - wordpress
+    command: ["tunnel", "--no-autoupdate", "--url", "http://wordpress:80", "--loglevel", "info"]
+
+volumes:
+  database_data:
+  wordpress_data:

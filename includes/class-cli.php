@@ -148,6 +148,8 @@ final class Cli {
 
 	/**
 	 * Writes, reads and deletes a probe object to verify the R2 credentials.
+	 *
+	 * @subcommand test-r2
 	 */
 	public function test_r2(): void {
 		$r2 = R2_Client::from_settings();
