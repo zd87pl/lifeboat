@@ -29,6 +29,8 @@ spl_autoload_register(
 	}
 );
 
+\Lifeboat\Edge::trust_forwarded_request();
+
 register_activation_hook( __FILE__, [ 'Lifeboat\\Plugin', 'activate' ] );
 register_deactivation_hook( __FILE__, [ 'Lifeboat\\Plugin', 'deactivate' ] );
 

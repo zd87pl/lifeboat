@@ -25,6 +25,10 @@ final class Plugin {
 			add_action( 'customize_save_after', [ $this, 'request_full_rebuild' ] );
 			add_action( 'switch_theme', [ $this, 'request_full_rebuild' ] );
 			add_action( 'wp_update_nav_menu', [ $this, 'request_full_rebuild' ] );
+			add_action( 'upgrader_process_complete', [ $this, 'request_full_rebuild' ] );
+			add_action( 'comment_post', [ $this, 'on_comment_posted' ], 10, 2 );
+			add_action( 'transition_comment_status', [ $this, 'on_comment_status' ], 10, 3 );
+			add_action( 'edit_comment', [ $this, 'on_comment_edited' ] );
 		}
 
 		if ( is_admin() ) {
@@ -158,7 +162,43 @@ final class Plugin {
 		$this->queue_incremental( array_values( array_diff( $this->affected_paths( $post ), [ $self ] ) ), $self ? [ $self ] : [] );
 	}
 
-	/** Theme, customizer or menu changes touch every page: schedule a debounced full rebuild. */
+	/** A new comment that is visible right away (auto-approved) changes its post's page. */
+	public function on_comment_posted( int $comment_id, $approved ): void {
+		$comment = get_comment( $comment_id );
+		if ( $comment && 1 === (int) $approved ) {
+			$this->refresh_comment_post( (int) $comment->comment_post_ID );
+		}
+	}
+
+	/**
+	 * Approving, unapproving, spamming, trashing or deleting a visible comment changes its post's page.
+	 * Uses the comment object the hook passes: after a permanent delete the row is already gone.
+	 */
+	public function on_comment_status( $new_status, $old_status, $comment ): void {
+		if ( 'approved' === $new_status || 'approved' === $old_status ) {
+			$this->refresh_comment_post( (int) $comment->comment_post_ID );
+		}
+	}
+
+	public function on_comment_edited( int $comment_id ): void {
+		$comment = get_comment( $comment_id );
+		if ( $comment && '1' === (string) $comment->comment_approved ) {
+			$this->refresh_comment_post( (int) $comment->comment_post_ID );
+		}
+	}
+
+	private function refresh_comment_post( int $post_id ): void {
+		$post = get_post( $post_id );
+		if ( ! $post || 'publish' !== $post->post_status || ! is_post_type_viewable( $post->post_type ) ) {
+			return;
+		}
+		$path = $this->permalink_path( $post );
+		if ( $path ) {
+			$this->queue_incremental( [ $path ], [] );
+		}
+	}
+
+	/** Theme, customizer, menu or code updates touch every page: schedule a debounced full rebuild. */
 	public function request_full_rebuild(): void {
 		if ( ! wp_next_scheduled( 'lifeboat_full_rebuild' ) ) {
 			wp_schedule_single_event( time() + 5 * max( 10, (int) Settings::get( 'debounce' ) ), 'lifeboat_full_rebuild' );

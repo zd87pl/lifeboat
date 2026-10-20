@@ -65,7 +65,9 @@ For an initial 100-site rollout:
   through the same Worker. It may differ from the plugin's private
   `LIFEBOAT_ORIGIN_URL` crawl address.
 - `prefix` is optional and defaults to `sites/<canonicalHost>`. Prefixes must be
-  unique so two sites cannot overwrite one another's snapshots. The plugin's
+  unique and must not nest (`sites/a` next to `sites/a/shop` is refused), so two
+  sites cannot overwrite one another's snapshots: a site's ingest key may write
+  anything under its own prefix. The plugin's
   `LIFEBOAT_PREFIX`, this value, and the Worker's R2 bucket binding must describe
   the same bucket/key location or fallback fails closed.
 - `aliases` is optional. Each alias gets its own KV record with `canonicalHost`
@@ -81,6 +83,34 @@ preserved as redundant redirects.
 
 All generated records set `force_fallback` to `false`, so applying the inventory
 also ends any active failover drill for the listed hosts.
+
+Optional per-site fields are copied to the canonical record and its aliases
+only when set, so the Worker's defaults (`failover`, AI policy `origin`) apply
+otherwise:
+
+- `mode`: `failover` or `edge` (see the routing table in the main README).
+- `ai`: `origin`, `edge`, `edge-only` or `block`.
+- `bypassPaths`: decoded path prefixes that edge mode always sends to
+  WordPress, e.g. `["/product/"]` for a store whose stock changes by the minute.
+- `bypassCookies`: cookie-name prefixes that make a visitor dynamic, on top of
+  the built-in WordPress, WooCommerce and Easy Digital Downloads cookies.
+- `ingestKeySha256`: the SHA-256 of the site's ingest key, for hosted
+  ("service") deployments. It goes on the canonical record only; aliases share
+  the canonical snapshot and cannot upload. Generate credentials with
+  `node fleet/site-key.mjs`, which prints the key for the site, this hash, and
+  an edge secret.
+
+Edge secrets are secrets, so the inventory refuses them. Keep them in a
+separate, unversioned file keyed by canonical hostname and pass it with
+`--secrets`:
+
+```json
+{ "example.com": { "edgeSecret": "..." } }
+```
+
+They are merged into the canonical and alias records at compile time and
+printed as `[redacted]` in the dry run. The same value goes into that site's
+`LIFEBOAT_EDGE_SECRET`, so WordPress accepts the Worker's visitor IP.
 
 ## Bootstrap the shared edge resources
 
@@ -182,7 +212,9 @@ R2 S3 write permissions are bucket-scoped, not restricted to a
 rotation and revocation but do not prevent a compromised origin from writing
 another site's keys. Treat the shared bucket as one trust boundary; divide
 higher-risk tenants across separate buckets and Worker deployments when that
-fleet-wide write blast radius is unacceptable.
+fleet-wide write blast radius is unacceptable — or give sites ingest keys
+instead of S3 credentials: the Worker's ingest API confines each key to its own
+site's prefix ([`../docs/service.md`](../docs/service.md)).
 
 The crawler should reach WordPress directly, not through the public Worker. If
 that is impossible, a request header is not sufficient by itself: the Worker

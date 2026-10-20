@@ -24,7 +24,7 @@ final class Snapshot_Builder {
 	public const LOCK_TTL       = 900;
 
 	private array $s;
-	private ?R2_Client $r2;
+	private ?Storage_Client $storage;
 	private Crawler $crawler;
 	private string $host;
 	private string $prefix;
@@ -38,7 +38,7 @@ final class Snapshot_Builder {
 
 	public function __construct( ?callable $log = null, int $persist_every = 25 ) {
 		$this->s             = Settings::all();
-		$this->r2            = R2_Client::from_settings();
+		$this->storage       = Settings::storage();
 		$this->crawler       = new Crawler( $this->s );
 		$this->host          = Settings::host();
 		$this->prefix        = Settings::prefix();
@@ -74,8 +74,8 @@ final class Snapshot_Builder {
 	/* ---------------------------------------------------------------- starting jobs */
 
 	public function start_full(): array|WP_Error {
-		if ( ! $this->r2 ) {
-			return new WP_Error( 'not_configured', 'Cloudflare R2 is not configured.' );
+		if ( ! $this->storage ) {
+			return new WP_Error( 'not_configured', (string) Settings::storage_problem() );
 		}
 		if ( self::current_job() ) {
 			return new WP_Error( 'busy', 'A snapshot job is already in progress.' );
@@ -123,8 +123,8 @@ final class Snapshot_Builder {
 	 * @param string[] $deletes decoded site paths to remove
 	 */
 	public function start_incremental( array $paths, array $deletes = [] ): array|WP_Error {
-		if ( ! $this->r2 ) {
-			return new WP_Error( 'not_configured', 'Cloudflare R2 is not configured.' );
+		if ( ! $this->storage ) {
+			return new WP_Error( 'not_configured', (string) Settings::storage_problem() );
 		}
 		if ( self::current_job() ) {
 			return new WP_Error( 'busy', 'A snapshot job is already in progress.' );
@@ -167,8 +167,8 @@ final class Snapshot_Builder {
 	 * @return array{state:string, ok?:bool, message?:string, processed?:int, remaining?:int, stats?:array}|WP_Error
 	 */
 	public function run( int $budget = 20 ): array|WP_Error {
-		if ( ! $this->r2 ) {
-			return new WP_Error( 'not_configured', 'Cloudflare R2 is not configured.' );
+		if ( ! $this->storage ) {
+			return new WP_Error( 'not_configured', (string) Settings::storage_problem() );
 		}
 		if ( ! Lock::acquire( self::LOCK, self::LOCK_TTL ) ) {
 			return new WP_Error( 'locked', 'Another process is working on the snapshot.' );
@@ -262,6 +262,7 @@ final class Snapshot_Builder {
 
 		$type = '' !== $res['type'] ? $res['type'] : Crawler::guess_type( $path );
 		$body = $res['body'];
+		$meta = $this->private_meta( $path, $res );
 
 		if ( Crawler::is_html( $type ) ) {
 			$found = $this->crawler->extract_from_html( $body, $base );
@@ -284,7 +285,7 @@ final class Snapshot_Builder {
 					}
 				}
 			}
-			$this->store( $key, $body, $type, 'page', $path );
+			$this->store( $key, $body, $type, 'page', $path, $meta );
 			return;
 		}
 
@@ -312,7 +313,16 @@ final class Snapshot_Builder {
 				}
 			}
 		}
-		$this->store( $key, $body, $type, 'asset', $path );
+		$this->store( $key, $body, $type, 'asset', $path, $meta, $res['cache_control'] );
+	}
+
+	/**
+	 * Pages the origin would not let a shared cache keep (no-store, private, no-cache, Set-Cookie)
+	 * are marked so the edge always fetches them live and serves this copy only during an outage.
+	 */
+	private function private_meta( string $path, array $res ): array {
+		$private = (bool) apply_filters( 'lifeboat_private_page', $res['private'], $path, $res['cache_control'] );
+		return $private ? [ 'lifeboat-cache' => 'private' ] : [];
 	}
 
 	private function process_asset( string $url, int $depth ): void {
@@ -359,7 +369,7 @@ final class Snapshot_Builder {
 		}
 
 		$type = '' !== $res['type'] ? $res['type'] : Crawler::guess_type( $path );
-		$this->store( $key, $res['body'], $type, 'asset', $path );
+		$this->store( $key, $res['body'], $type, 'asset', $path, [], $res['cache_control'] );
 
 		if ( Crawler::is_css( $type ) ) {
 			foreach ( $this->crawler->extract_from_css( $res['body'] ) as $ref ) {
@@ -373,9 +383,9 @@ final class Snapshot_Builder {
 
 	/**
 	 * Upload an object into the job's prefix, or server-side copy it from the previous snapshot
-	 * when the content hash is unchanged.
+	 * when the content hash and metadata are unchanged.
 	 */
-	private function store( string $key, string $body, string $type, string $kind, string $src, array $meta = [] ): void {
+	private function store( string $key, string $body, string $type, string $kind, string $src, array $meta = [], string $cache_control = '' ): void {
 		$sha   = hash( 'sha256', $body );
 		$entry = [
 			'sha256' => $sha,
@@ -387,9 +397,16 @@ final class Snapshot_Builder {
 		if ( $meta ) {
 			$entry['meta'] = $meta;
 		}
+		if ( '' !== $cache_control ) {
+			$entry['cache_control'] = $cache_control;
+		}
 
 		$old  = $this->prev['objects'][ $key ] ?? null;
-		$same = $old && ( $old['sha256'] ?? '' ) === $sha && ( $old['type'] ?? '' ) === $type && ( $old['meta'] ?? [] ) === $meta;
+		$same = $old
+			&& ( $old['sha256'] ?? '' ) === $sha
+			&& ( $old['type'] ?? '' ) === $type
+			&& ( $old['meta'] ?? [] ) === $meta
+			&& ( $old['cache_control'] ?? '' ) === $cache_control;
 
 		if ( $same && 'incremental' === $this->job['kind'] ) {
 			$this->job['objects'][ $key ] = $entry;
@@ -399,7 +416,7 @@ final class Snapshot_Builder {
 
 		$dst = $this->job['prefix'] . '/' . $key;
 		if ( $same && $this->job['prev_prefix'] ) {
-			$r = $this->r2->copy( $this->job['prev_prefix'] . '/' . $key, $dst );
+			$r = $this->storage->copy( $this->job['prev_prefix'] . '/' . $key, $dst );
 			if ( ! is_wp_error( $r ) ) {
 				$this->job['objects'][ $key ] = $entry;
 				$this->job['stats']['copied']++;
@@ -408,7 +425,7 @@ final class Snapshot_Builder {
 			// fall through to a normal upload
 		}
 
-		$r = $this->r2->put( $dst, $body, $type, $meta + [ 'sha256' => $sha ] );
+		$r = $this->storage->put( $dst, $body, $type, $meta + [ 'sha256' => $sha ], $cache_control );
 		if ( is_wp_error( $r ) ) {
 			$this->error( "upload $key: " . $r->get_error_message() );
 			$this->job['stats']['failed']++;
@@ -453,7 +470,7 @@ final class Snapshot_Builder {
 				$why = sprintf( 'error rate %.1f%% exceeds the %s%% limit', $err_pct, $this->s['max_error_pct'] );
 			}
 
-			$r = $this->r2->put( $job['prefix'] . '/manifest.json', self::json( $this->manifest( $job['objects'], $counts, $job['started'], $ok ) ), 'application/json' );
+			$r = $this->storage->put( $job['prefix'] . '/manifest.json', self::json( $this->manifest( $job['objects'], $counts, $job['started'], $ok ) ), 'application/json' );
 			if ( is_wp_error( $r ) ) {
 				$ok  = false;
 				$why = 'manifest upload failed: ' . $r->get_error_message();
@@ -481,9 +498,10 @@ final class Snapshot_Builder {
 				return $this->end_job(
 					true,
 					sprintf(
-						'Snapshot %s promoted: %d pages, %d assets, %d redirects, %s (%d uploaded, %d copied, %d failed).',
+						'Snapshot %s promoted: %d pages (%d private), %d assets, %d redirects, %s (%d uploaded, %d copied, %d failed).',
 						$job['id'],
 						$counts['pages'],
+						$counts['private'],
 						$counts['assets'],
 						$counts['redirects'],
 						size_format( $counts['bytes'] ),
@@ -501,7 +519,7 @@ final class Snapshot_Builder {
 		$deleted = 0;
 		foreach ( $job['deletes'] as $path ) {
 			$key = Keys::path_to_key( $path );
-			$r   = $this->r2->delete( $job['prefix'] . '/' . $key );
+			$r   = $this->storage->delete( $job['prefix'] . '/' . $key );
 			if ( is_wp_error( $r ) ) {
 				$this->error( "delete $key: " . $r->get_error_message() );
 				$this->job['stats']['failed']++;
@@ -512,13 +530,16 @@ final class Snapshot_Builder {
 		}
 		$counts = self::counts( $objects );
 		$ok     = 0 === $this->job['stats']['failed'] && 0 === $this->job['stats']['failed_pages'];
-		$r      = $ok
-			? $this->r2->put( $job['prefix'] . '/manifest.json', self::json( $this->manifest( $objects, $counts, (int) ( $this->prev['created'] ?? $job['started'] ), true ) ), 'application/json' )
-			: true;
-		if ( is_wp_error( $r ) ) {
-			$this->error( 'manifest update failed: ' . $r->get_error_message() );
-			$ok = false;
-		} elseif ( $ok ) {
+
+		// Uploads and deletions above already changed the live prefix in place. Publish that state even
+		// when part of the job failed: the edge caches objects per pointer revision, so an unchanged
+		// pointer would keep serving copies this job replaced or removed.
+		if ( $ok || $this->job['stats']['uploaded'] > 0 || $deleted > 0 ) {
+			$r = $this->storage->put( $job['prefix'] . '/manifest.json', self::json( $this->manifest( $objects, $counts, (int) ( $this->prev['created'] ?? $job['started'] ), true ) ), 'application/json' );
+			if ( is_wp_error( $r ) ) {
+				$this->error( 'manifest update failed: ' . $r->get_error_message() );
+				$ok = false;
+			}
 			$r = $this->write_pointer( $counts );
 			if ( is_wp_error( $r ) ) {
 				$this->error( 'pointer update failed: ' . $r->get_error_message() );
@@ -555,17 +576,19 @@ final class Snapshot_Builder {
 		$this->store( '__404.html', $res['body'], $res['type'], 'system', $probe );
 	}
 
-	private function write_pointer( array $counts ): true|WP_Error {
+	private function write_pointer( array $counts ): bool|WP_Error {
 		$pointer = [
 			'snapshot_id' => $this->job['id'],
 			'prefix'      => $this->job['prefix'],
 			'manifest'    => $this->job['prefix'] . '/manifest.json',
 			'host'        => $this->host,
 			'updated_at'  => gmdate( 'c' ),
+			// Changes on every write (updated_at has one-second resolution); the edge keys its cache by it.
+			'revision'    => bin2hex( random_bytes( 8 ) ),
 			'counts'      => $counts,
 			'generator'   => 'lifeboat/' . LIFEBOAT_VERSION,
 		];
-		return $this->r2->put( $this->prefix . '/current.json', self::json( $pointer ), 'application/json' );
+		return $this->storage->put( $this->prefix . '/current.json', self::json( $pointer ), 'application/json' );
 	}
 
 	private function manifest( array $objects, array $counts, int $created, bool $promoted ): array {
@@ -585,11 +608,11 @@ final class Snapshot_Builder {
 
 	/** Delete snapshot prefixes beyond keep_snapshots, never the one just promoted. */
 	public function prune(): void {
-		if ( ! $this->r2 ) {
+		if ( ! $this->storage ) {
 			return;
 		}
 		$keep = max( 1, (int) $this->s['keep_snapshots'] );
-		$list = $this->r2->list_prefixes( $this->prefix . '/snapshots/' );
+		$list = $this->storage->list_prefixes( $this->prefix . '/snapshots/' );
 		if ( is_wp_error( $list ) ) {
 			$this->error( 'prune: ' . $list->get_error_message() );
 			return;
@@ -601,12 +624,12 @@ final class Snapshot_Builder {
 			if ( $victim === $current ) {
 				continue;
 			}
-			$keys = $this->r2->list_all_keys( $victim );
+			$keys = $this->storage->list_all_keys( $victim );
 			if ( is_wp_error( $keys ) ) {
 				$this->error( 'prune: ' . $keys->get_error_message() );
 				continue;
 			}
-			$r = $keys ? $this->r2->delete_many( $keys ) : true;
+			$r = $keys ? $this->storage->delete_many( $keys ) : true;
 			if ( is_wp_error( $r ) ) {
 				$this->error( 'prune: ' . $r->get_error_message() );
 			} else {
@@ -646,12 +669,12 @@ final class Snapshot_Builder {
 
 	/** @return array{id:string,prefix:string,objects:array,created:int}|null */
 	private function load_current_manifest(): ?array {
-		$cur = $this->r2->get_json( $this->prefix . '/current.json' );
+		$cur = $this->storage->get_json( $this->prefix . '/current.json' );
 		if ( is_wp_error( $cur ) || empty( $cur['snapshot_id'] ) ) {
 			return null;
 		}
 		$prefix = $this->prefix . '/snapshots/' . $cur['snapshot_id'];
-		$m      = $this->r2->get_json( $cur['manifest'] ?? $prefix . '/manifest.json' );
+		$m      = $this->storage->get_json( $cur['manifest'] ?? $prefix . '/manifest.json' );
 		return [
 			'id'      => (string) $cur['snapshot_id'],
 			'prefix'  => $prefix,
@@ -701,10 +724,14 @@ final class Snapshot_Builder {
 			'pages'     => 0,
 			'assets'    => 0,
 			'redirects' => 0,
+			'private'   => 0,
 			'bytes'     => 0,
 		];
 		foreach ( $objects as $o ) {
 			$c['bytes'] += (int) ( $o['size'] ?? 0 );
+			if ( 'private' === ( $o['meta']['lifeboat-cache'] ?? '' ) ) {
+				$c['private']++;
+			}
 			switch ( $o['kind'] ?? '' ) {
 				case 'page':
 					$c['pages']++;

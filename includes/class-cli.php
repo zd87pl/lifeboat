@@ -90,11 +90,12 @@ final class Cli {
 		$job  = Snapshot_Builder::current_job();
 		$res  = Snapshot_Builder::last_result();
 
+		$storage = Settings::storage();
 		WP_CLI::log( 'Bucket prefix:  ' . Settings::prefix() );
-		WP_CLI::log( 'R2 configured:  ' . ( Settings::r2_ready() ? 'yes' : 'NO' ) );
+		WP_CLI::log( 'Storage:        ' . ( $storage ? $storage->label() : 'NOT READY: ' . Settings::storage_problem() ) );
 		WP_CLI::log( 'Origin URL:     ' . ( Settings::get( 'origin_url' ) ?: '(public URL — set LIFEBOAT_ORIGIN_URL)' ) );
 		if ( $last ) {
-			WP_CLI::log( sprintf( 'Live snapshot:  %s, promoted %s ago, refreshed %s ago (%d pages, %d assets, %s)', $last['id'], human_time_diff( (int) $last['promoted_at'] ), human_time_diff( (int) $last['updated_at'] ), $last['counts']['pages'], $last['counts']['assets'], size_format( $last['counts']['bytes'] ) ) );
+			WP_CLI::log( sprintf( 'Live snapshot:  %s, promoted %s ago, refreshed %s ago (%d pages, %d of them private, %d assets, %s)', $last['id'], human_time_diff( (int) $last['promoted_at'] ), human_time_diff( (int) $last['updated_at'] ), $last['counts']['pages'], $last['counts']['private'] ?? 0, $last['counts']['assets'], size_format( $last['counts']['bytes'] ) ) );
 		} else {
 			WP_CLI::log( 'Live snapshot:  none' );
 		}
@@ -128,45 +129,41 @@ final class Cli {
 	}
 
 	/**
-	 * Reads current.json from R2 and reports what the Worker would serve.
+	 * Reads current.json back from storage and reports what the Worker would serve.
 	 */
 	public function verify(): void {
-		$r2 = R2_Client::from_settings();
-		if ( ! $r2 ) {
-			WP_CLI::error( 'R2 is not configured.' );
+		$storage = Settings::storage();
+		if ( ! $storage ) {
+			WP_CLI::error( (string) Settings::storage_problem() );
 		}
-		$cur = $r2->get_json( Settings::prefix() . '/current.json' );
+		$cur = $storage->get_json( Settings::prefix() . '/current.json' );
 		if ( is_wp_error( $cur ) ) {
 			WP_CLI::error( $cur->get_error_message() );
 		}
 		WP_CLI::log( 'current.json → snapshot ' . $cur['snapshot_id'] . ' (updated ' . $cur['updated_at'] . ')' );
 		foreach ( [ 'index.html', '__404.html', 'manifest.json' ] as $k ) {
-			WP_CLI::log( sprintf( '  %-14s %s', $k, $r2->exists( $cur['prefix'] . '/' . $k ) ? 'present' : 'MISSING' ) );
+			WP_CLI::log( sprintf( '  %-14s %s', $k, $storage->exists( $cur['prefix'] . '/' . $k ) ? 'present' : 'MISSING' ) );
 		}
 		WP_CLI::success( sprintf( '%d pages, %d assets, %d redirects, %s', $cur['counts']['pages'], $cur['counts']['assets'], $cur['counts']['redirects'], size_format( $cur['counts']['bytes'] ) ) );
 	}
 
 	/**
-	 * Writes, reads and deletes a probe object to verify the R2 credentials.
+	 * Verifies the snapshot storage: writes, reads and deletes a probe object, and for a Lifeboat
+	 * service also checks that it stores this site under the prefix the plugin writes to.
 	 *
-	 * @subcommand test-r2
+	 * @subcommand test-storage
+	 * @alias test-r2
 	 */
-	public function test_r2(): void {
-		$r2 = R2_Client::from_settings();
-		if ( ! $r2 ) {
-			WP_CLI::error( 'R2 is not configured (account id, bucket, access key id, secret).' );
+	public function test_storage(): void {
+		$storage = Settings::storage();
+		if ( ! $storage ) {
+			WP_CLI::error( (string) Settings::storage_problem() );
 		}
-		$key = Settings::prefix() . '/__lifeboat-probe.txt';
-		$r   = $r2->put( $key, 'ok ' . gmdate( 'c' ), 'text/plain' );
+		$r = $storage->check( Settings::prefix() );
 		if ( is_wp_error( $r ) ) {
-			WP_CLI::error( 'PUT failed: ' . $r->get_error_message() );
+			WP_CLI::error( $storage->label() . ': ' . $r->get_error_message() );
 		}
-		$b = $r2->get( $key );
-		if ( is_wp_error( $b ) ) {
-			WP_CLI::error( 'GET failed: ' . $b->get_error_message() );
-		}
-		$r2->delete( $key );
-		WP_CLI::success( 'R2 write/read/delete OK on bucket ' . $r2->bucket() . '.' );
+		WP_CLI::success( $r );
 	}
 
 	/**

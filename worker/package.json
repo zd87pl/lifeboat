@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test",
+    "test": "node --test test/*.test.js",
     "fleet:bootstrap-kv": "wrangler kv namespace create lifeboat-sites --binding SITES --update-config"
   },
   "devDependencies": {

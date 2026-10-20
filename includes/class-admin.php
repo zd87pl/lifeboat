@@ -22,7 +22,13 @@ final class Admin {
 	public function settings(): void {
 		register_setting( self::PAGE, Settings::OPTION, [ 'sanitize_callback' => [ $this, 'sanitize' ] ] );
 
-		add_settings_section( 'r2', 'Cloudflare R2', static function (): void {
+		add_settings_section( 'service', 'Lifeboat service', static function (): void {
+			echo '<p>Connect to a hosted Lifeboat edge with the service URL and site key you were given. The service stores this site&rsquo;s snapshots under its own prefix, so no storage credentials live on this site. When connected, the R2 settings below are not used. Constants in wp-config.php (LIFEBOAT_SERVICE_URL, LIFEBOAT_SERVICE_KEY) override these fields.</p>';
+		}, self::PAGE );
+		$this->field( 'service_url', 'Service URL', 'service', 'text', 'e.g. https://ingest.example.net' );
+		$this->field( 'service_key', 'Site key', 'service', 'secret', 'Leave blank to keep the stored value.' );
+
+		add_settings_section( 'r2', 'Cloudflare R2 (your own bucket)', static function (): void {
 			echo '<p>Create an R2 API token with <em>Object Read &amp; Write</em> scoped to one bucket. Values defined as constants in wp-config.php (LIFEBOAT_R2_ACCOUNT_ID, LIFEBOAT_R2_BUCKET, LIFEBOAT_R2_ACCESS_KEY_ID, LIFEBOAT_R2_SECRET_ACCESS_KEY, LIFEBOAT_ORIGIN_URL, LIFEBOAT_PREFIX) override the fields below.</p>';
 		}, self::PAGE );
 		$this->field( 'r2_account_id', 'Account ID', 'r2', 'text' );
@@ -30,6 +36,12 @@ final class Admin {
 		$this->field( 'r2_access_key_id', 'Access key ID', 'r2', 'text' );
 		$this->field( 'r2_secret_access_key', 'Secret access key', 'r2', 'secret', 'Leave blank to keep the stored value.' );
 		$this->field( 'prefix', 'Bucket prefix', 'r2', 'text', 'Defaults to sites/' . Settings::host() . '. One bucket can hold many sites.' );
+
+		add_settings_section( 'edge', 'Edge', static function (): void {
+			echo '<p>The Lifeboat Worker reaches this server through its origin address and reports the public address in X-Forwarded-Host. Set the same edge secret here (LIFEBOAT_EDGE_SECRET) and in the Worker&rsquo;s site record to also receive real visitor IP addresses.</p>';
+		}, self::PAGE );
+		$this->field( 'trust_edge_host', 'Trust the edge&rsquo;s forwarded host', 'edge', 'checkbox', 'Treat requests forwarded for ' . Settings::host() . ' as requests for this site. Without this, forwarded requests are redirected to the public address in a loop.' );
+		$this->field( 'edge_secret', 'Edge secret', 'edge', 'secret', 'Leave blank to keep the stored value. When set, forwarded values are trusted only from a Worker that sends it.' );
 
 		add_settings_section( 'crawl', 'Crawling', static function (): void {
 			echo '<p>The crawler fetches pages as an anonymous visitor. Point it at the origin directly (loopback) so it never goes through Cloudflare — otherwise it could snapshot the fallback itself.</p>';
@@ -111,7 +123,7 @@ final class Admin {
 				continue;
 			}
 			$value = $input[ $key ];
-			if ( 'r2_secret_access_key' === $key ) {
+			if ( in_array( $key, Settings::SECRETS, true ) ) {
 				if ( '' !== trim( (string) $value ) ) {
 					$out[ $key ] = trim( (string) $value );
 				}
@@ -132,6 +144,11 @@ final class Admin {
 		if ( '' !== $out['origin_url'] && ! preg_match( '#^https?://#i', $out['origin_url'] ) ) {
 			add_settings_error( self::PAGE, 'origin_url', 'Origin URL must start with http:// or https://.' );
 			$out['origin_url'] = '';
+		}
+		$out['service_url'] = rtrim( (string) $out['service_url'], '/' );
+		if ( '' !== $out['service_url'] && ! Settings::valid_service_url( $out['service_url'] ) ) {
+			add_settings_error( self::PAGE, 'service_url', 'The service URL must be an https:// address (plain http is accepted only for localhost).' );
+			$out['service_url'] = '';
 		}
 		if ( '' === (string) $out['crawl_secret'] ) {
 			$out['crawl_secret'] = wp_generate_password( 32, false );
@@ -176,23 +193,18 @@ final class Admin {
 				$msg = 'Old snapshots pruned.';
 				break;
 			case 'test':
-				$r2 = R2_Client::from_settings();
-				if ( ! $r2 ) {
+				$storage = Settings::storage();
+				if ( ! $storage ) {
 					$type = 'error';
-					$msg  = 'R2 is not configured.';
+					$msg  = (string) Settings::storage_problem();
 					break;
 				}
-				$key = Settings::prefix() . '/__lifeboat-probe.txt';
-				$r   = $r2->put( $key, 'ok ' . gmdate( 'c' ), 'text/plain' );
-				if ( ! is_wp_error( $r ) ) {
-					$r = $r2->get( $key );
-					$r2->delete( $key );
-				}
+				$r = $storage->check( Settings::prefix() );
 				if ( is_wp_error( $r ) ) {
 					$type = 'error';
-					$msg  = 'R2 test failed: ' . $r->get_error_message();
+					$msg  = $storage->label() . ' test failed: ' . $r->get_error_message();
 				} else {
-					$msg = 'R2 write/read/delete succeeded.';
+					$msg = $r;
 				}
 				break;
 			case 'probe':
@@ -248,7 +260,7 @@ final class Admin {
 		if ( $res && empty( $res['ok'] ) ) {
 			printf( '<div class="notice notice-error"><p>%s: the last %s job failed — %s</p></div>', $link, esc_html( $res['kind'] ), esc_html( $res['message'] ) );
 		}
-		if ( ! $last && ! Snapshot_Builder::current_job() && Settings::r2_ready() ) {
+		if ( ! $last && ! Snapshot_Builder::current_job() && Settings::storage_ready() ) {
 			printf( '<div class="notice notice-info"><p>%s: no failover snapshot exists yet. Run <code>wp lifeboat build</code> or click “Build snapshot now”.</p></div>', $link );
 		}
 	}
@@ -264,11 +276,12 @@ final class Admin {
 		$next    = wp_next_scheduled( 'lifeboat_scheduled_build' );
 		$rows    = [];
 
-		$rows['R2']            = Settings::r2_ready() ? 'configured — prefix <code>' . esc_html( Settings::prefix() ) . '</code>' : '<strong>not configured</strong>';
+		$storage               = Settings::storage();
+		$rows['Storage']       = $storage ? esc_html( $storage->label() ) . ' — prefix <code>' . esc_html( Settings::prefix() ) . '</code>' : '<strong>' . esc_html( (string) Settings::storage_problem() ) . '</strong>';
 		$rows['Permalinks']    = get_option( 'permalink_structure' ) ? 'pretty permalinks on' : '<strong>pretty permalinks are required</strong>';
 		$rows['WP-Cron']       = ( defined( 'DISABLE_WP_CRON' ) && DISABLE_WP_CRON ) ? 'disabled in wp-config (system cron must run <code>wp cron event run --due-now</code>)' : 'triggered by page loads';
 		$rows['Live snapshot'] = $last
-			? sprintf( '<code>%s</code> — promoted %s ago, refreshed %s ago; %d pages, %d assets, %d redirects, %s', esc_html( $last['id'] ), esc_html( human_time_diff( (int) $last['promoted_at'] ) ), esc_html( human_time_diff( (int) $last['updated_at'] ) ), (int) $last['counts']['pages'], (int) $last['counts']['assets'], (int) $last['counts']['redirects'], esc_html( size_format( (int) $last['counts']['bytes'] ) ) )
+			? sprintf( '<code>%s</code> — promoted %s ago, refreshed %s ago; %d pages (%d always fetched live because the origin marks them private), %d assets, %d redirects, %s', esc_html( $last['id'] ), esc_html( human_time_diff( (int) $last['promoted_at'] ) ), esc_html( human_time_diff( (int) $last['updated_at'] ) ), (int) $last['counts']['pages'], (int) ( $last['counts']['private'] ?? 0 ), (int) $last['counts']['assets'], (int) $last['counts']['redirects'], esc_html( size_format( (int) $last['counts']['bytes'] ) ) )
 			: 'none yet';
 		$rows['Current job']   = $job
 			? sprintf( '%s <code>%s</code> — %d processed, %d queued, %d uploaded, %d copied, %d failed (started %s ago)', esc_html( $job['kind'] ), esc_html( $job['id'] ), (int) $job['processed'], count( $job['queue'] ), (int) $job['stats']['uploaded'], (int) $job['stats']['copied'], (int) $job['stats']['failed'], esc_html( human_time_diff( (int) $job['started'] ) ) )
@@ -297,7 +310,7 @@ final class Admin {
 		$buttons = [
 			'build'       => [ 'Build snapshot now', 'primary' ],
 			'incremental' => [ 'Run pending incremental', 'secondary' ],
-			'test'        => [ 'Test R2 connection', 'secondary' ],
+			'test'        => [ 'Test storage connection', 'secondary' ],
 			'probe'       => [ 'Test origin fetch', 'secondary' ],
 			'prune'       => [ 'Prune old snapshots', 'secondary' ],
 			'cancel'      => [ 'Cancel current job', 'secondary' ],

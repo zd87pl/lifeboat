@@ -45,6 +45,7 @@ final class Crawler {
 	];
 
 	private string $host;
+	private string $host_header;
 	private string $site_base;
 	private string $origin_base;
 	private bool $ssl_verify;
@@ -58,6 +59,9 @@ final class Crawler {
 		$p    = wp_parse_url( $home );
 
 		$this->host          = strtolower( (string) ( $p['host'] ?? '' ) );
+		// A non-default port is part of the canonical host: without it WordPress redirects every
+		// loopback request to the home URL's port.
+		$this->host_header   = $this->host . ( isset( $p['port'] ) ? ':' . $p['port'] : '' );
 		$this->site_base     = ( $p['scheme'] ?? 'https' ) . '://' . ( $p['host'] ?? '' ) . ( isset( $p['port'] ) ? ':' . $p['port'] : '' );
 		$this->origin_base   = rtrim( trim( (string) $s['origin_url'] ), '/' );
 		$this->ssl_verify    = '' === $this->origin_base ? true : (bool) $s['origin_ssl_verify'];
@@ -77,7 +81,12 @@ final class Crawler {
 
 	/**
 	 * Fetch a decoded site path as an anonymous visitor, without following redirects.
-	 * @return array{status:int,type:string,body:string,location:?string,truncated:bool}|WP_Error
+	 *
+	 * `private` is true when the origin would not let a shared cache keep the response
+	 * (Cache-Control no-store, private or no-cache, or a Set-Cookie): in edge mode such pages are
+	 * always fetched live, and the snapshot copy is used only while the origin is down.
+	 *
+	 * @return array{status:int,type:string,body:string,location:?string,truncated:bool,cache_control:string,private:bool}|WP_Error
 	 */
 	public function fetch( string $path ): array|WP_Error {
 		$enc     = Keys::encode_path( $path );
@@ -87,7 +96,7 @@ final class Crawler {
 		];
 		if ( '' !== $this->origin_base ) {
 			$url             = $this->origin_base . $enc;
-			$headers['Host'] = $this->host;
+			$headers['Host'] = $this->host_header;
 			if ( $this->forward_proto ) {
 				$headers['X-Forwarded-Proto'] = 'https';
 			}
@@ -113,18 +122,26 @@ final class Crawler {
 		if ( '' !== $snapshot ) {
 			return new WP_Error(
 				'lifeboat_fallback',
-				"Responses are being served from the fallback snapshot ($snapshot), not from WordPress. Set LIFEBOAT_ORIGIN_URL so the crawler reaches the origin directly."
+				"Responses are being served from the Lifeboat snapshot ($snapshot) by the edge, not from WordPress. Set LIFEBOAT_ORIGIN_URL so the crawler reaches the origin directly."
 			);
 		}
 
-		$body = (string) wp_remote_retrieve_body( $res );
+		$body          = (string) wp_remote_retrieve_body( $res );
+		$cache_control = self::header( $res, 'cache-control' );
 		return [
-			'status'    => (int) wp_remote_retrieve_response_code( $res ),
-			'type'      => self::header( $res, 'content-type' ),
-			'body'      => $body,
-			'location'  => self::header( $res, 'location' ) ?: null,
-			'truncated' => strlen( $body ) > $this->max_bytes,
+			'status'        => (int) wp_remote_retrieve_response_code( $res ),
+			'type'          => self::header( $res, 'content-type' ),
+			'body'          => $body,
+			'location'      => self::header( $res, 'location' ) ?: null,
+			'truncated'     => strlen( $body ) > $this->max_bytes,
+			'cache_control' => preg_match( '/^[\x20-\x7e]{1,256}$/', $cache_control ) ? $cache_control : '',
+			'private'       => self::is_private( $cache_control, '' !== self::header( $res, 'set-cookie' ) ),
 		];
+	}
+
+	/** Shared caches must not keep these (the same rule Cloudflare's cache applies by default). */
+	public static function is_private( string $cache_control, bool $sets_cookie ): bool {
+		return $sets_cookie || (bool) preg_match( '/(?:^|[\s,])(?:no-store|private|no-cache)(?:$|[\s,=])/i', $cache_control );
 	}
 
 	private static function header( $res, string $name ): string {
@@ -157,7 +174,12 @@ final class Crawler {
 	 */
 	public function extract_from_html( string $html, string $base ): array {
 		$links  = [];
-		$assets = [];
+		$assets = self::import_map_urls( $html );
+
+		// Script bodies are code, not markup: "t.src=r" in WordPress's emoji loader is not an
+		// attribute, and following it costs the origin a 404 render per page. Import maps (collected
+		// above) are the one kind of script that names assets.
+		$html = preg_replace( '#(<script\b[^>]*>).*?(</script\s*>)#is', '$1$2', $html ) ?? $html;
 
 		foreach ( self::grab( '#<(?:a|area)\b[^>]*?\bhref\s*=\s*' . self::VAL . '#i', $html ) as $r ) {
 			$links[] = $r;
@@ -214,6 +236,28 @@ final class Crawler {
 			'links'  => $abs( $links ),
 			'assets' => $abs( $assets ),
 		];
+	}
+
+	/** @return string[] module URLs named by <script type="importmap"> blocks (WordPress script modules). */
+	private static function import_map_urls( string $html ): array {
+		$out = [];
+		if ( ! preg_match_all( '#<script\b[^>]*\btype\s*=\s*["\']?importmap\b[^>]*>(.*?)</script\s*>#is', $html, $m ) ) {
+			return $out;
+		}
+		foreach ( $m[1] as $json ) {
+			$map = json_decode( trim( $json ), true );
+			if ( is_array( $map ) ) {
+				array_walk_recursive(
+					$map,
+					static function ( $value ) use ( &$out ): void {
+						if ( is_string( $value ) ) {
+							$out[] = $value;
+						}
+					}
+				);
+			}
+		}
+		return $out;
 	}
 
 	/** @return string[] raw (non-absolutized) references from CSS text. */
