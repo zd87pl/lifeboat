@@ -36,12 +36,13 @@ $check( 3 === count( $assets ) && ! in_array( '/post/r', $assets, true ), 'code 
 $check( [ 'https://example.com/about/' ] === $found['links'], 'page links are collected' );
 
 echo "Service URL validation\n";
-$check( Lifeboat\Admin::valid_service_url( 'https://ingest.example.net' ), 'https is accepted' );
-$check( Lifeboat\Admin::valid_service_url( 'http://127.0.0.1:8787' ), 'http on 127.0.0.1 is accepted' );
-$check( Lifeboat\Admin::valid_service_url( 'http://dev.localhost' ), 'http on *.localhost is accepted' );
-$check( ! Lifeboat\Admin::valid_service_url( 'http://ingest.example.net' ), 'plain http elsewhere is refused' );
-$check( ! Lifeboat\Admin::valid_service_url( 'https://user:pass@ingest.example.net' ), 'embedded credentials are refused' );
-$check( ! Lifeboat\Admin::valid_service_url( 'ftp://ingest.example.net' ), 'other schemes are refused' );
+$check( Lifeboat\Settings::valid_service_url( 'https://ingest.example.net' ), 'https is accepted' );
+$check( Lifeboat\Settings::valid_service_url( 'http://127.0.0.1:8787' ), 'http on 127.0.0.1 is accepted' );
+$check( Lifeboat\Settings::valid_service_url( 'http://dev.localhost' ), 'http on *.localhost is accepted' );
+$check( ! Lifeboat\Settings::valid_service_url( 'http://ingest.example.net' ), 'plain http elsewhere is refused' );
+$check( ! Lifeboat\Settings::valid_service_url( 'https://user:pass@ingest.example.net' ), 'embedded credentials are refused' );
+$check( ! Lifeboat\Settings::valid_service_url( 'ftp://ingest.example.net' ), 'other schemes are refused' );
+
 
 echo "Forwarded request trust (LIFEBOAT_EDGE_SECRET is defined for this run)\n";
 $home     = wp_parse_url( home_url( '/' ) );

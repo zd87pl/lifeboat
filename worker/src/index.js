@@ -29,6 +29,18 @@ const AI_CRAWLER = /\b(?:GPTBot|ChatGPT-User|OAI-SearchBot|ClaudeBot|Claude-User
 // turn an otherwise public page view into an origin request.
 const TRACKING_PARAM = /^(?:utm_[a-z0-9_]+|fbclid|gclid|gbraid|wbraid|dclid|msclkid|yclid|twclid|ttclid|li_fat_id|igshid|srsltid|mc_cid|mc_eid|_ga|_gl|_hsenc|_hsmi|_ke|mkt_tok)$/i;
 
+// Parameters through which the REST API and WooCommerce AJAX answer on any
+// path. They are matched as PHP registers them (see phpParamName).
+const API_PARAMS = new Set(["rest_route", "wc-ajax"]);
+
+// Headers only this Worker may set on origin requests. PHP maps "X_Foo" and
+// "X-Foo" to the same HTTP_X_FOO, so every spelling of these is stripped.
+const TRUSTED_FORWARD_HEADERS = new Set(["x-forwarded-host", "x-forwarded-proto", "x-lifeboat-edge", "x-lifeboat-client-ip"]);
+
+// Lifeboat's own files inside a snapshot prefix. A request path that maps to
+// one of them (/manifest.json, /__404.html) is never answered with it.
+const RESERVED_KEYS = new Set(["manifest.json", "__404.html"]);
+
 // Cookies meaning the visitor sees something a public snapshot cannot show: a
 // session, a cart, a password-protected post, or their own pending comment.
 const DYNAMIC_COOKIE_PREFIXES = [
@@ -190,14 +202,31 @@ export function isBypassRequest(request, decodedPath, crawlSecret) {
 
   // The REST API and WooCommerce AJAX also answer on any path through these
   // parameters; a page snapshot is never a valid response to an API call.
-  const query = new URL(request.url).searchParams;
-  if (query.has("rest_route") || query.has("wc-ajax")) return true;
+  for (const name of new URL(request.url).searchParams.keys()) {
+    if (API_PARAMS.has(phpParamName(name))) return true;
+  }
 
   const cookie = request.headers.get("Cookie") || "";
   if (/(?:^|;\s*)wordpress_logged_in_[^=;\s]*=/.test(cookie)) return true;
 
   const suppliedSecret = request.headers.get("X-Lifeboat-Crawl");
   return typeof crawlSecret === "string" && crawlSecret !== "" && suppliedSecret === crawlSecret;
+}
+
+/**
+ * A query parameter name as PHP registers it in $_GET: leading spaces dropped,
+ * " " and "." turned into "_", an array suffix removed, and an unclosed "["
+ * turned into "_" (so "rest.route" and "rest[route" both reach WordPress as
+ * rest_route).
+ */
+export function phpParamName(name) {
+  const trimmed = name.replace(/^ +/, "");
+  const bracket = trimmed.indexOf("[");
+  if (bracket === -1) return trimmed.replace(/[ .]/g, "_");
+  const head = trimmed.slice(0, bracket).replace(/[ .]/g, "_");
+  return trimmed.indexOf("]", bracket) === -1
+    ? `${head}_${trimmed.slice(bracket + 1).replace(/[ .[]/g, "_")}`
+    : head;
 }
 
 /** True when an edge-mode visitor must be answered by WordPress itself. */
@@ -276,6 +305,9 @@ async function originFirst(state, isPrivate, current = null) {
 async function serveEdge(state, only) {
   const { request, env, ctx, site, url, decodedPath, crawler } = state;
   const bucket = env.SNAPSHOTS;
+  // Crawlers reach WordPress only for the bare page URL, never with parameters
+  // WordPress or a plugin might act on (?add-to-cart= on any path, for one).
+  const originState = crawler ? withoutQuery(state) : state;
 
   // Only crawlers reach this point with a query string (visitors are routed to
   // the origin first); for them a query variant is never in the snapshot.
@@ -294,13 +326,13 @@ async function serveEdge(state, only) {
     // origin-first proxy, so enabling edge mode before the first build is safe.
     return only || key === null
       ? { response: readOnlyResponse(request.method), route: "readonly" }
-      : originFirst(state, false, null);
+      : originFirst(originState, false, null);
   }
 
   const banner = !crawler && (site.forceFallback || isBreakerOpen(breakerKeyFor(site)));
 
   const cache = key && request.method === "GET" && !banner ? edgeCache() : null;
-  const cacheKey = cache ? edgeCacheKey(url, current, key) : null;
+  const cacheKey = cache ? await edgeCacheKey(url, current, key) : null;
   if (cache) {
     let cached = null;
     try {
@@ -313,11 +345,11 @@ async function serveEdge(state, only) {
 
   let object = null;
   try {
-    object = key ? await readObject(bucket, `${current.prefix}/${key}`, request.method) : null;
+    object = key && !RESERVED_KEYS.has(key) ? await readObject(bucket, `${current.prefix}/${key}`, request.method) : null;
   } catch {
     return only
       ? { response: readOnlyResponse(request.method), route: "readonly" }
-      : originFirst(state, false, null);
+      : originFirst(originState, false, null);
   }
 
   // The origin answered this page with no-store/private/Set-Cookie when it was
@@ -331,7 +363,7 @@ async function serveEdge(state, only) {
   if (!object) {
     // A clean page URL the snapshot lacks may be new content: ask WordPress,
     // unless the crawler policy is edge-only or the URL is a query variant.
-    if (!only && key !== null) return originFirst(state, false, current);
+    if (!only && key !== null) return originFirst(originState, false, current);
     try {
       const notFound = await readObject(bucket, `${current.prefix}/__404.html`, request.method);
       const response = notFound
@@ -582,12 +614,13 @@ async function fetchOrigin(request, site, timeoutMs) {
   const timer = setTimeout(() => controller.abort("Origin timeout"), timeoutMs);
   try {
     const originRequest = new Request(sourceUrl.toString(), request);
+    // Only this Worker may vouch for the forwarded values; never relay a
+    // client's own attempt to do so, in any spelling PHP would accept.
+    for (const name of [...originRequest.headers.keys()]) {
+      if (TRUSTED_FORWARD_HEADERS.has(name.toLowerCase().replaceAll("_", "-"))) originRequest.headers.delete(name);
+    }
     originRequest.headers.set("X-Forwarded-Host", forwardedHost);
     originRequest.headers.set("X-Forwarded-Proto", forwardedProto);
-    // Only this Worker may vouch for the forwarded values; never relay a
-    // client's own attempt to do so.
-    originRequest.headers.delete("X-Lifeboat-Edge");
-    originRequest.headers.delete("X-Lifeboat-Client-IP");
     if (site.edgeSecret) {
       originRequest.headers.set("X-Lifeboat-Edge", site.edgeSecret);
       const clientIp = request.headers.get("CF-Connecting-IP");
@@ -643,7 +676,7 @@ async function serveSnapshot(state, preloaded) {
     if (!current) return readOnlyResponse(request.method);
 
     const key = pathToKey(decodedPath);
-    let object = await readObject(env.SNAPSHOTS, `${current.prefix}/${key}`, request.method);
+    let object = RESERVED_KEYS.has(key) ? null : await readObject(env.SNAPSHOTS, `${current.prefix}/${key}`, request.method);
     let status = 200;
 
     if (!object) {
@@ -733,13 +766,15 @@ async function readCurrent(bucket, site, expectedHost) {
   const expectedPrefix = `${site.prefix}/snapshots/${pointer.snapshot_id}`;
   if (pointer.prefix !== expectedPrefix) return null;
 
-  // Incremental updates rewrite objects in place and bump updated_at, so the
-  // pair identifies one exact state of the snapshot for edge-cache keys.
-  const updatedAt = typeof pointer.updated_at === "string" && pointer.updated_at.length <= 64 ? pointer.updated_at : "";
+  // Incremental updates rewrite objects in place, and every pointer write
+  // carries a fresh revision (updated_at from older plugins), so the pair
+  // identifies one exact state of the snapshot for edge-cache keys.
+  const revision = [pointer.revision, pointer.updated_at]
+    .find((value) => typeof value === "string" && value !== "" && value.length <= 64) ?? "";
   return {
     snapshotId: pointer.snapshot_id,
     prefix: pointer.prefix,
-    version: updatedAt ? `${pointer.snapshot_id}@${updatedAt}` : pointer.snapshot_id,
+    version: revision ? `${pointer.snapshot_id}@${revision}` : pointer.snapshot_id,
   };
 }
 
@@ -859,11 +894,21 @@ function edgeCache() {
 
 /**
  * Edge-cache entries are keyed by the snapshot version, so a promotion or an
- * incremental update is visible as soon as the pointer is re-read, without a purge.
+ * incremental update is visible as soon as the pointer is re-read, without a
+ * purge. The object key is hashed: a request path (which may hold encoded dot
+ * segments) must never be able to steer the lookup to another entry.
  */
-function edgeCacheKey(url, current, key) {
-  const encodedKey = key.split("/").map((segment) => encodeURIComponent(segment)).join("/");
-  return new Request(`${url.protocol}//${url.host}/__lifeboat-edge/${encodeURIComponent(current.version)}/${encodedKey}`);
+async function edgeCacheKey(url, current, key) {
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(key)));
+  const hex = Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return new Request(`${url.protocol}//${url.host}/__lifeboat-edge/${encodeURIComponent(current.version)}/${hex}`);
+}
+
+function withoutQuery(state) {
+  if (state.url.search === "") return state;
+  const bare = new URL(state.url);
+  bare.search = "";
+  return { ...state, url: bare, request: new Request(bare.toString(), state.request) };
 }
 
 function toEdgeCacheEntry(response) {
@@ -881,6 +926,7 @@ function fromEdgeCache(request, cached) {
   if (clientCacheControl) headers.set("Cache-Control", clientCacheControl);
   else headers.delete("Cache-Control");
   headers.set("X-Lifeboat-Route", "edge");
+  headers.set("X-Lifeboat-Cache", "hit");
 
   const etag = headers.get("ETag");
   if (etag && etagMatches(request.headers.get("If-None-Match"), etag)) {

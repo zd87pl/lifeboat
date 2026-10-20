@@ -36,21 +36,28 @@ script requests once a router is in use.
   parity.
 - Publishing: `test-storage` (and the `test-r2` alias), a full build through
   the ingest API with exactly the fixture page marked private, `verify`, a
-  second build that copies unchanged objects inside storage, and `prune`.
+  second build that copies unchanged objects inside storage, and `prune`. A
+  plain-http service URL defined as a constant is refused.
+- Partial failure: an incremental update with an injected storage error
+  ([`partial-incremental.php`](partial-incremental.php)) still publishes what
+  it changed, so the edge cache stops serving the page it removed.
 - Tenant isolation: a wrong key gets 401; the site's key cannot write another
   site's prefix.
 - Edge serving: pages, campaign-tagged URLs and versioned assets come from the
   snapshot with no origin request; `If-None-Match` gets 304.
 - Dynamic routing: search, the REST API and the no-store page reach WordPress
-  exactly once each; a comment POST records the visitor IP forwarded by the
-  verified edge; approving it refreshes the edge copy; logging in through the
-  edge works and logged-in views are live.
+  exactly once each; `/manifest.json` never returns Lifeboat's own manifest; a
+  comment POST records the visitor IP forwarded by the verified edge even when
+  the client smuggles an `X_Lifeboat_Client_IP` header; approving the comment
+  refreshes the edge copy and deleting it permanently removes it again;
+  logging in through the edge works and logged-in views are live.
 - AI crawlers: GPTBot reads from the edge, its add-to-cart crawl trap gets the
   snapshot 404 and the REST API a 403, with no origin traffic.
 - Outage: with WordPress stopped, edge pages still serve, then carry the
   saved-copy banner and disabled forms with `Cache-Control: no-store`; dynamic
-  pages fall back to their snapshot path; comment POSTs and the REST API get
-  the read-only 503; unknown URLs get the captured 404.
+  pages fall back to their snapshot path; comment POSTs and the REST API (also
+  spelled `?rest.route=`) get the read-only 503; unknown URLs get the captured
+  404.
 - No PHP warnings, notices or deprecations from the plugin (`WP_DEBUG_LOG`).
 
 Set `LIFEBOAT_E2E_PHP=/path/to/php8.1` to run the same checks on another PHP

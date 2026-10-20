@@ -23,8 +23,6 @@ final class Snapshot_Builder {
 	public const LOCK           = 'build';
 	public const LOCK_TTL       = 900;
 
-	private const NOT_CONFIGURED = 'No snapshot storage is configured: connect a Lifeboat service or a Cloudflare R2 bucket.';
-
 	private array $s;
 	private ?Storage_Client $storage;
 	private Crawler $crawler;
@@ -77,7 +75,7 @@ final class Snapshot_Builder {
 
 	public function start_full(): array|WP_Error {
 		if ( ! $this->storage ) {
-			return new WP_Error( 'not_configured', self::NOT_CONFIGURED );
+			return new WP_Error( 'not_configured', (string) Settings::storage_problem() );
 		}
 		if ( self::current_job() ) {
 			return new WP_Error( 'busy', 'A snapshot job is already in progress.' );
@@ -126,7 +124,7 @@ final class Snapshot_Builder {
 	 */
 	public function start_incremental( array $paths, array $deletes = [] ): array|WP_Error {
 		if ( ! $this->storage ) {
-			return new WP_Error( 'not_configured', self::NOT_CONFIGURED );
+			return new WP_Error( 'not_configured', (string) Settings::storage_problem() );
 		}
 		if ( self::current_job() ) {
 			return new WP_Error( 'busy', 'A snapshot job is already in progress.' );
@@ -170,7 +168,7 @@ final class Snapshot_Builder {
 	 */
 	public function run( int $budget = 20 ): array|WP_Error {
 		if ( ! $this->storage ) {
-			return new WP_Error( 'not_configured', self::NOT_CONFIGURED );
+			return new WP_Error( 'not_configured', (string) Settings::storage_problem() );
 		}
 		if ( ! Lock::acquire( self::LOCK, self::LOCK_TTL ) ) {
 			return new WP_Error( 'locked', 'Another process is working on the snapshot.' );
@@ -532,13 +530,16 @@ final class Snapshot_Builder {
 		}
 		$counts = self::counts( $objects );
 		$ok     = 0 === $this->job['stats']['failed'] && 0 === $this->job['stats']['failed_pages'];
-		$r      = $ok
-			? $this->storage->put( $job['prefix'] . '/manifest.json', self::json( $this->manifest( $objects, $counts, (int) ( $this->prev['created'] ?? $job['started'] ), true ) ), 'application/json' )
-			: true;
-		if ( is_wp_error( $r ) ) {
-			$this->error( 'manifest update failed: ' . $r->get_error_message() );
-			$ok = false;
-		} elseif ( $ok ) {
+
+		// Uploads and deletions above already changed the live prefix in place. Publish that state even
+		// when part of the job failed: the edge caches objects per pointer revision, so an unchanged
+		// pointer would keep serving copies this job replaced or removed.
+		if ( $ok || $this->job['stats']['uploaded'] > 0 || $deleted > 0 ) {
+			$r = $this->storage->put( $job['prefix'] . '/manifest.json', self::json( $this->manifest( $objects, $counts, (int) ( $this->prev['created'] ?? $job['started'] ), true ) ), 'application/json' );
+			if ( is_wp_error( $r ) ) {
+				$this->error( 'manifest update failed: ' . $r->get_error_message() );
+				$ok = false;
+			}
 			$r = $this->write_pointer( $counts );
 			if ( is_wp_error( $r ) ) {
 				$this->error( 'pointer update failed: ' . $r->get_error_message() );
@@ -582,6 +583,8 @@ final class Snapshot_Builder {
 			'manifest'    => $this->job['prefix'] . '/manifest.json',
 			'host'        => $this->host,
 			'updated_at'  => gmdate( 'c' ),
+			// Changes on every write (updated_at has one-second resolution); the edge keys its cache by it.
+			'revision'    => bin2hex( random_bytes( 8 ) ),
 			'counts'      => $counts,
 			'generator'   => 'lifeboat/' . LIFEBOAT_VERSION,
 		];

@@ -236,7 +236,9 @@ define( 'WP_DEBUG_LOG', '$WORK_DIR/debug.log' );
 
 // Lifeboat: crawl the origin directly, publish through the service with this site's key only.
 define( 'LIFEBOAT_ORIGIN_URL', '$ORIGIN_URL' );
-define( 'LIFEBOAT_SERVICE_URL', '$INGEST_URL' );
+if ( ! defined( 'LIFEBOAT_SERVICE_URL' ) ) { // lets one check substitute a plain-http URL
+	define( 'LIFEBOAT_SERVICE_URL', '$INGEST_URL' );
+}
 define( 'LIFEBOAT_SERVICE_KEY', '$SITE_KEY' );
 define( 'LIFEBOAT_EDGE_SECRET', '$EDGE_SECRET' );
 
@@ -275,6 +277,10 @@ if node --input-type=module -e '
 else
     bad "Worker key mapping matches the plugin for every sample path"
 fi
+
+PLAIN_HTTP="$(wp --exec="define( 'LIFEBOAT_SERVICE_URL', 'http://ingest.example.net' );" eval \
+    'echo null === Lifeboat\Settings::storage() ? Lifeboat\Settings::storage_problem() : "storage accepted";' 2>&1 || true)"
+check "a plain-http service URL set as a constant is refused" grep -q 'must be an https://' <<<"$PLAIN_HTTP"
 
 section "Publishing through the ingest API with a per-site key"
 STORAGE_OUTPUT="$(wp lifeboat test-storage 2>&1 || true)"
@@ -326,13 +332,15 @@ request /private-page/
 check "a page the origin marks no-store is fetched live (HTTP $STATUS)" from_origin
 check "each of them reached the origin exactly once" equal "$(origin_hits)" "$((before + 3))"
 check "the origin saw the search with its query string" origin_saw 'GET /?s=lifeboat'
+request /manifest.json
+check "Lifeboat's internal manifest is never served at /manifest.json (HTTP $STATUS)" from_origin
 
-request /wp-comments-post.php -X POST -H 'CF-Connecting-IP: 203.0.113.7' \
+request /wp-comments-post.php -X POST -H 'CF-Connecting-IP: 203.0.113.7' -H 'X_Lifeboat_Client_IP: 6.6.6.6' \
     --data-urlencode 'comment=Comments keep working behind the edge.' --data-urlencode 'author=E2E Visitor' \
     --data-urlencode 'email=visitor@example.invalid' --data "comment_post_ID=$POST_ID&comment_parent=0"
 check "a comment POST is answered by WordPress (HTTP $STATUS)" status_is 302
 COMMENT="$(wp comment list --post_id="$POST_ID" --status=hold --fields=comment_ID,comment_author_IP --format=csv | tail -n +2 | head -n 1)"
-check "WordPress recorded the visitor's IP from the verified edge ($COMMENT)" equal "${COMMENT#*,}" '203.0.113.7'
+check "WordPress recorded the visitor's IP from the verified edge, not a smuggled one ($COMMENT)" equal "${COMMENT#*,}" '203.0.113.7'
 
 wp comment approve "${COMMENT%%,*}" --quiet
 INCREMENTAL_OUTPUT="$(wp lifeboat incremental 2>&1 || true)"
@@ -353,6 +361,24 @@ check "exactly one snapshot remains in storage" equal "$(node -e 'console.log(JS
 request /lifeboat-e2e-post/
 check "the edge serves the new snapshot" not_equal "$(header X-Lifeboat)" "$FIRST_SNAPSHOT"
 check "including the approved comment" body_has 'Comments keep working behind the edge.'
+
+wp comment delete "${COMMENT%%,*}" --force --quiet
+DELETE_OUTPUT="$(wp lifeboat incremental 2>&1 || true)"
+check "permanently deleting the comment refreshed its post" grep -q '1 refreshed' <<<"$DELETE_OUTPUT"
+request /lifeboat-e2e-post/
+check "the edge copy no longer shows the deleted comment" body_lacks 'Comments keep working behind the edge.'
+
+request /sample-page/
+request /sample-page/
+check "a repeated edge request is answered from the edge cache" equal "$(header X-Lifeboat-Cache)" 'hit'
+PARTIAL="$(wp eval-file "$SCRIPT_DIR/partial-incremental.php" /sample-page/ /hello-world/ 2>&1 || true)"
+printf '    %s\n' "$PARTIAL"
+check "an injected storage failure fails the incremental job" grep -q '"job_ok":false' <<<"$PARTIAL"
+check "but what the job changed is still published" grep -q '"revision_moved":true' <<<"$PARTIAL"
+request /sample-page/
+check "so the edge cache stops serving the page it removed" from_origin
+request /hello-world/
+check "while the page whose deletion failed stays on the edge" route_is edge
 
 JAR="$WORK_DIR/cookies.txt"
 request /wp-login.php -c "$JAR" -b "$JAR"
@@ -391,6 +417,8 @@ request /wp-comments-post.php -X POST --data "comment=x&comment_post_ID=$POST_ID
 check "a comment POST gets the read-only 503 (HTTP $STATUS)" status_is 503
 request /wp-json/
 check "the REST API gets the read-only 503, never a page (HTTP $STATUS)" status_is 503
+request '/?rest.route=/wp/v2/users'
+check "so does an API call spelled rest.route, which PHP reads as rest_route (HTTP $STATUS)" status_is 503
 request /never-published/
 check "an unknown URL gets the captured 404 page (HTTP $STATUS)" status_is 404
 check "from the snapshot" from_snapshot

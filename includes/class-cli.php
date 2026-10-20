@@ -92,7 +92,7 @@ final class Cli {
 
 		$storage = Settings::storage();
 		WP_CLI::log( 'Bucket prefix:  ' . Settings::prefix() );
-		WP_CLI::log( 'Storage:        ' . ( $storage ? $storage->label() : 'NOT CONFIGURED (Lifeboat service or Cloudflare R2)' ) );
+		WP_CLI::log( 'Storage:        ' . ( $storage ? $storage->label() : 'NOT READY: ' . Settings::storage_problem() ) );
 		WP_CLI::log( 'Origin URL:     ' . ( Settings::get( 'origin_url' ) ?: '(public URL — set LIFEBOAT_ORIGIN_URL)' ) );
 		if ( $last ) {
 			WP_CLI::log( sprintf( 'Live snapshot:  %s, promoted %s ago, refreshed %s ago (%d pages, %d of them private, %d assets, %s)', $last['id'], human_time_diff( (int) $last['promoted_at'] ), human_time_diff( (int) $last['updated_at'] ), $last['counts']['pages'], $last['counts']['private'] ?? 0, $last['counts']['assets'], size_format( $last['counts']['bytes'] ) ) );
@@ -134,7 +134,7 @@ final class Cli {
 	public function verify(): void {
 		$storage = Settings::storage();
 		if ( ! $storage ) {
-			WP_CLI::error( 'No snapshot storage is configured.' );
+			WP_CLI::error( (string) Settings::storage_problem() );
 		}
 		$cur = $storage->get_json( Settings::prefix() . '/current.json' );
 		if ( is_wp_error( $cur ) ) {
@@ -157,7 +157,7 @@ final class Cli {
 	public function test_storage(): void {
 		$storage = Settings::storage();
 		if ( ! $storage ) {
-			WP_CLI::error( 'No snapshot storage is configured: set LIFEBOAT_SERVICE_URL and LIFEBOAT_SERVICE_KEY, or the LIFEBOAT_R2_* credentials.' );
+			WP_CLI::error( (string) Settings::storage_problem() );
 		}
 		$r = $storage->check( Settings::prefix() );
 		if ( is_wp_error( $r ) ) {

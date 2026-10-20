@@ -318,6 +318,18 @@ export function compileInventory(raw, { development = false, secrets: rawSecrets
     prefixes.set(site.prefix, site.canonicalHost);
   }
 
+  // A site's key may write anything under its prefix, so one prefix inside
+  // another would let the outer site overwrite the inner site's snapshots.
+  for (const [prefix, host] of prefixes) {
+    const segments = prefix.split("/");
+    for (let length = 1; length < segments.length; length += 1) {
+      const ancestor = segments.slice(0, length).join("/");
+      if (prefixes.has(ancestor)) {
+        fail(`prefix ${prefix} of ${host} lies inside prefix ${ancestor} of ${prefixes.get(ancestor)}; prefixes must not nest`);
+      }
+    }
+  }
+
   for (const site of sites) {
     for (const alias of site.aliases) {
       if (keyOwners.has(alias)) {

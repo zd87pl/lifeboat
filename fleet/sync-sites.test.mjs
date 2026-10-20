@@ -67,6 +67,22 @@ test("invalid routing fields are rejected with the field path", () => {
   }
 });
 
+test("prefixes must not nest, in either order", () => {
+  const sites = (...entries) => ({ version: 1, sites: entries });
+  const site = (canonicalHost, prefix) => ({ canonicalHost, origin: `https://${canonicalHost}-origin.example.net`, ...(prefix ? { prefix } : {}) });
+
+  for (const inventory of [
+    sites(site("example.com"), site("shop.example.net", "sites/example.com/shop")),
+    sites(site("shop.example.net", "sites/example.com/shop"), site("example.com")),
+    sites(site("example.com"), site("everything.example.net", "sites")),
+  ]) {
+    assert.throws(() => compileInventory(inventory), /must not nest/);
+  }
+
+  const siblings = compileInventory(sites(site("a.example"), site("ab.example"), site("b.example", "sites/a.example-2")));
+  assert.equal(siblings.sites.length, 3, "sharing a string prefix is not nesting");
+});
+
 test("edge secrets come only from the secrets file and are redacted for display", () => {
   const { records } = compileInventory(inventory({ aliases: ["www.example.com"] }), {
     secrets: { "example.com": { edgeSecret: EDGE_SECRET } },

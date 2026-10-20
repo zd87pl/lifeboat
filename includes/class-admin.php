@@ -146,7 +146,7 @@ final class Admin {
 			$out['origin_url'] = '';
 		}
 		$out['service_url'] = rtrim( (string) $out['service_url'], '/' );
-		if ( '' !== $out['service_url'] && ! self::valid_service_url( $out['service_url'] ) ) {
+		if ( '' !== $out['service_url'] && ! Settings::valid_service_url( $out['service_url'] ) ) {
 			add_settings_error( self::PAGE, 'service_url', 'The service URL must be an https:// address (plain http is accepted only for localhost).' );
 			$out['service_url'] = '';
 		}
@@ -154,20 +154,6 @@ final class Admin {
 			$out['crawl_secret'] = wp_generate_password( 32, false );
 		}
 		return $out;
-	}
-
-	/** The site key travels in every request, so only loopback development may use plain HTTP. */
-	public static function valid_service_url( string $url ): bool {
-		$p = wp_parse_url( $url );
-		if ( ! is_array( $p ) || empty( $p['host'] ) || isset( $p['user'] ) || isset( $p['query'] ) || isset( $p['fragment'] ) ) {
-			return false;
-		}
-		if ( 'https' === strtolower( (string) ( $p['scheme'] ?? '' ) ) ) {
-			return true;
-		}
-		$host = strtolower( trim( $p['host'], '[]' ) );
-		return 'http' === strtolower( (string) ( $p['scheme'] ?? '' ) )
-			&& ( 'localhost' === $host || str_ends_with( $host, '.localhost' ) || '127.0.0.1' === $host || '::1' === $host );
 	}
 
 	/* ---------------------------------------------------------------- actions */
@@ -210,7 +196,7 @@ final class Admin {
 				$storage = Settings::storage();
 				if ( ! $storage ) {
 					$type = 'error';
-					$msg  = 'No snapshot storage is configured: connect a Lifeboat service or a Cloudflare R2 bucket.';
+					$msg  = (string) Settings::storage_problem();
 					break;
 				}
 				$r = $storage->check( Settings::prefix() );
@@ -291,7 +277,7 @@ final class Admin {
 		$rows    = [];
 
 		$storage               = Settings::storage();
-		$rows['Storage']       = $storage ? esc_html( $storage->label() ) . ' — prefix <code>' . esc_html( Settings::prefix() ) . '</code>' : '<strong>not configured</strong>';
+		$rows['Storage']       = $storage ? esc_html( $storage->label() ) . ' — prefix <code>' . esc_html( Settings::prefix() ) . '</code>' : '<strong>' . esc_html( (string) Settings::storage_problem() ) . '</strong>';
 		$rows['Permalinks']    = get_option( 'permalink_structure' ) ? 'pretty permalinks on' : '<strong>pretty permalinks are required</strong>';
 		$rows['WP-Cron']       = ( defined( 'DISABLE_WP_CRON' ) && DISABLE_WP_CRON ) ? 'disabled in wp-config (system cron must run <code>wp cron event run --due-now</code>)' : 'triggered by page loads';
 		$rows['Live snapshot'] = $last

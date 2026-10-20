@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { afterEach, beforeEach, test } from "node:test";
 
-import { __testing, handleRequest, hasSignificantQuery, isAiCrawler, isAssetPath } from "../src/index.js";
+import { __testing, handleRequest, hasSignificantQuery, isAiCrawler, isAssetPath, phpParamName } from "../src/index.js";
 import { FakeCache, FakeR2, kv, pointer, r2Object, waitUntilCollector } from "./fakes.js";
 
 const HOST = "site.example";
@@ -301,13 +301,14 @@ test("edge objects are cached per snapshot version and private pages never enter
   await (await handleRequest(get("/wp-content/themes/t/style.css"), env, ctx)).text();
   await ctx.settle();
   assert.equal(cache.puts.length, 1);
-  assert.match(cache.puts[0], new RegExp(`/__lifeboat-edge/${ID}/wp-content/themes/t/style\\.css$`));
+  assert.match(cache.puts[0], new RegExp(`/__lifeboat-edge/${ID}/[0-9a-f]{64}$`));
 
   const reads = r2.calls.length;
   const cached = await handleRequest(get("/wp-content/themes/t/style.css"), env, ctx);
   assert.equal(await cached.text(), "body{}");
   assert.equal(cached.headers.get("Cache-Control"), "public, max-age=31536000");
   assert.equal(cached.headers.get("X-Lifeboat-Route"), "edge");
+  assert.equal(cached.headers.get("X-Lifeboat-Cache"), "hit");
   assert.equal(cached.headers.get("X-Lifeboat"), ID);
   assert.deepEqual(r2.calls.slice(reads), [`sites/${HOST}/current.json`], "only the pointer is read on a cache hit");
 
@@ -323,7 +324,7 @@ test("edge objects are cached per snapshot version and private pages never enter
   await (await handleRequest(get("/wp-content/themes/t/style.css"), env, ctx)).text();
   await ctx.settle();
   assert.equal(cache.puts.length, 2);
-  assert.match(cache.puts[1], /20260901-140000%402026-09-01T15%3A00%3A00%2B00%3A00/);
+  assert.match(cache.puts[1], /\/__lifeboat-edge\/20260901-140000%402026-09-01T15%3A00%3A00%2B00%3A00\/[0-9a-f]{64}$/);
 });
 
 test("a KV incident keeps serving the last site record this isolate saw", async () => {
@@ -615,4 +616,107 @@ test("metering records one Analytics Engine data point per site request", async 
 
   const throwing = siteEnv(snapshotBucket(), {}, { METRICS: { writeDataPoint() { throw new Error("quota"); } } });
   assert.equal((await handleRequest(get("/"), throwing)).status, 200, "metering never changes the response");
+});
+
+test("encoded dot segments cannot steer the edge cache to another version's entries", async () => {
+  const cache = new FakeCache();
+  globalThis.caches = { default: cache };
+  const ctx = waitUntilCollector();
+  const r2 = snapshotBucket({ [`${PREFIX}/secret/index.html`]: r2Object("unpublished secret") });
+  const env = siteEnv(r2, {}, { POINTER_TTL_MS: "0" });
+  origin();
+
+  assert.equal(await (await handleRequest(get("/secret/"), env, ctx)).text(), "unpublished secret");
+  await ctx.settle();
+
+  // Unpublish: the object goes and the pointer moves to a new version.
+  r2.entries.delete(`${PREFIX}/secret/index.html`);
+  r2.entries.set(`sites/${HOST}/current.json`, pointer(HOST, ID, PREFIX, "2026-09-01T15:00:00+00:00"));
+
+  for (const path of ["/secret/", `/..%2F${ID}%2Fsecret%2F`, `/..%2F..%2F__lifeboat-edge%2F${ID}%2Fsecret%2F`]) {
+    const response = await handleRequest(get(path), env, ctx);
+    assert.notEqual(await response.text(), "unpublished secret", path);
+  }
+});
+
+test("every spelling of the forwarding headers is replaced by the Worker's own", async () => {
+  const seen = origin();
+  const secret = "edge-secret-0123456789";
+
+  await handleRequest(get("/?s=x", {
+    "CF-Connecting-IP": "203.0.113.9",
+    X_Lifeboat_Client_IP: "6.6.6.6",
+    X_Lifeboat_Edge: "guess",
+    X_Forwarded_Host: "attacker.example",
+    x_forwarded_proto: "http",
+  }), siteEnv(snapshotBucket(), { edgeSecret: secret }));
+
+  const names = [...seen[0].headers.keys()];
+  assert.deepEqual(names.filter((name) => name.includes("_")), []);
+  assert.equal(seen[0].headers.get("X-Lifeboat-Client-IP"), "203.0.113.9");
+  assert.equal(seen[0].headers.get("X-Lifeboat-Edge"), secret);
+  assert.equal(seen[0].headers.get("X-Forwarded-Host"), HOST);
+  assert.equal(seen[0].headers.get("X-Forwarded-Proto"), "https");
+});
+
+test("Lifeboat's own manifest and 404 objects are never served for request paths", async () => {
+  const r2 = snapshotBucket({ [`${PREFIX}/manifest.json`]: r2Object('{"objects":{"cart/index.html":{}}}', { contentType: "application/json" }) });
+
+  const seen = origin(() => new Response("site manifest", { status: 200 }));
+  const visitor = await handleRequest(get("/manifest.json"), siteEnv(r2));
+  const notFoundPage = await handleRequest(get("/__404.html"), siteEnv(r2));
+  assert.equal(await visitor.text(), "site manifest");
+  assert.equal(await notFoundPage.text(), "site manifest");
+  assert.equal(seen.length, 2);
+
+  const crawler = await handleRequest(get("/manifest.json", { "User-Agent": GPTBOT }), siteEnv(r2, { ai: "edge-only" }));
+  assert.equal(crawler.status, 404);
+  assert.equal(await crawler.text(), "saved not found");
+
+  origin("down");
+  __testing.resetBreakers();
+  const outage = await handleRequest(get("/manifest.json"), siteEnv(r2, { mode: "failover" }));
+  assert.equal(outage.status, 404);
+  assert.equal(await outage.text(), "saved not found");
+});
+
+test("API parameters are recognized under PHP's name mangling", async () => {
+  for (const [name, expected] of [
+    ["rest_route", "rest_route"],
+    ["rest.route", "rest_route"],
+    ["rest route", "rest_route"],
+    ["  rest_route", "rest_route"],
+    ["rest[route", "rest_route"],
+    ["rest_route[]", "rest_route"],
+    ["rest_route[x]", "rest_route"],
+    ["a.b[c.d", "a_b_c_d"],
+    ["wc-ajax", "wc-ajax"],
+  ]) {
+    assert.equal(phpParamName(name), expected, name);
+  }
+
+  for (const path of ["/?rest.route=/wp/v2/users", "/?rest+route=/wp/v2/users", "/?rest%5Broute=/wp/v2/users"]) {
+    origin("down");
+    __testing.resetBreakers();
+    const outage = await handleRequest(get(path), siteEnv(snapshotBucket(), { mode: "failover" }));
+    assert.equal(outage.status, 503, path);
+  }
+
+  const seen = origin();
+  const crawler = await handleRequest(get("/wp-content/x.css?rest.route=/wp/v2/users", { "User-Agent": GPTBOT }), siteEnv(snapshotBucket(), { ai: "edge" }));
+  assert.equal(crawler.status, 403);
+  assert.equal(seen.length, 0);
+});
+
+test("crawlers reach WordPress only with the bare page URL", async () => {
+  const seen = origin();
+  const env = siteEnv(snapshotBucket(), { mode: "failover", ai: "edge" });
+
+  await handleRequest(get("/missing.css?add-to-cart=42", { "User-Agent": GPTBOT }), env);
+  await handleRequest(get("/new-post/?utm_source=x", { "User-Agent": GPTBOT }), env);
+
+  assert.deepEqual(seen.map((request) => request.url), [
+    "https://origin.example/missing.css",
+    "https://origin.example/new-post/",
+  ]);
 });

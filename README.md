@@ -43,11 +43,11 @@ The Worker decides per request. In edge mode:
 | A URL the snapshot does not have (e.g. published seconds ago) | WordPress | the captured 404 page |
 | A page the origin marked `no-store`/`private`/`no-cache`/`Set-Cookie` when it was captured | WordPress | its snapshot copy, labelled as a saved copy |
 | Any other query string (search, `?p=`, `?replytocom=`, filters), `*.php`, an `Authorization` header, a session-like cookie (`wp-postpass_*`, `comment_author_*`, `woocommerce_items_in_cart`, `woocommerce_cart_hash`, `wp_woocommerce_session_*`, `edd_items_in_cart`), or a site's own `bypassPaths`/`bypassCookies` | WordPress | snapshot copy of the path, labelled as a saved copy |
-| Non-`GET`/`HEAD`, `/wp-admin`, `/wp-login.php`, `/wp-json`, `?rest_route=`, `?wc-ajax=`, `/wp-cron.php`, a `wordpress_logged_in_*` cookie, the exact crawler secret | WordPress | read-only 503 — never a page snapshot |
+| Non-`GET`/`HEAD`, `/wp-admin`, `/wp-login.php`, `/wp-json`, `?rest_route=` or `?wc-ajax=` (matched as PHP reads parameter names, so `?rest.route=` counts), `/wp-cron.php`, a `wordpress_logged_in_*` cookie, the exact crawler secret | WordPress | read-only 503 — never a page snapshot |
 
 In failover mode every request behaves like one of the last two rows: WordPress first, and on failure the snapshot — except for the private requests of the last row, which get the read-only 503.
 
-Edge-served responses carry `X-Lifeboat: <snapshot id>`, `X-Lifeboat-Route: edge` and the object's `ETag` (`If-None-Match` revalidates with 304). Assets keep the `Cache-Control` the origin sent when they were captured. Outage-labelled HTML is `Cache-Control: no-store`, so browsers do not keep the banner after recovery. The Worker also keeps a per-colo edge cache keyed by snapshot version, so a promotion or incremental update is visible as soon as the pointer is re-read (every 5 s by default) — no purge step.
+Edge-served responses carry `X-Lifeboat: <snapshot id>`, `X-Lifeboat-Route: edge` and the object's `ETag` (`If-None-Match` revalidates with 304); answers from the edge cache add `X-Lifeboat-Cache: hit`. Assets keep the `Cache-Control` the origin sent when they were captured. Outage-labelled HTML is `Cache-Control: no-store`, so browsers do not keep the banner after recovery. The Worker also keeps a per-colo edge cache keyed by the pointer's revision, which changes on every promotion or incremental update — including one that partly failed — so changes are visible as soon as the pointer is re-read (every 5 s by default), without a purge step.
 
 Edge mode never makes a healthy site less available: with no promoted snapshot yet, or with R2 unreachable, it behaves as a plain pass-through proxy.
 
@@ -58,7 +58,7 @@ Edge mode never makes a healthy site less available: with no promoted snapshot y
 | `ai` | Snapshot pages | Clean URLs not in the snapshot | Query variants (`?add-to-cart=`, sort/filter traps) | APIs, admin, mutations |
 |---|---|---|---|---|
 | `origin` (default) | treated exactly like any visitor | | | |
-| `edge` | snapshot, no banner | WordPress | snapshot 404 | 403 |
+| `edge` | snapshot, no banner | WordPress, without any query string | snapshot 404 | 403 |
 | `edge-only` | snapshot, no banner | snapshot 404 | snapshot 404 | 403 |
 | `block` | 403 (`/robots.txt` stays readable, as RFC 9309 requires) | | | |
 
@@ -81,7 +81,7 @@ Edge mode serves what an anonymous visitor saw when the page was last captured. 
 ./e2e/run.sh
 ```
 
-This needs only PHP 8.0+ with `pdo_sqlite`, Node.js 22+ with npm, and curl, tar, unzip and setsid. It installs a throwaway WordPress on SQLite behind PHP's built-in server, runs the real Worker under `wrangler dev` (workerd with a local R2 bucket) in edge mode, publishes snapshots through the service ingest API with a per-site key, and checks about fifty behaviours: edge serving with no origin traffic, dynamic routing (search, REST, comments, login, private pages), visitor-IP forwarding, comment-driven refresh, server-side copy and pruning, the AI-crawler policy, tenant isolation, and the outage drill. See [`e2e/README.md`](e2e/README.md).
+This needs only PHP 8.0+ with `pdo_sqlite`, Node.js 22+ with npm, and curl, tar, unzip and setsid. It installs a throwaway WordPress on SQLite behind PHP's built-in server, runs the real Worker under `wrangler dev` (workerd with a local R2 bucket) in edge mode, publishes snapshots through the service ingest API with a per-site key, and checks over sixty behaviours: edge serving with no origin traffic, dynamic routing (search, REST, comments, login, private pages), visitor-IP forwarding, comment-driven refresh, server-side copy and pruning, the AI-crawler policy, tenant isolation, and the outage drill. See [`e2e/README.md`](e2e/README.md).
 
 ### Against real Cloudflare (failover demo)
 
@@ -217,12 +217,15 @@ Alert on **staleness**, not just build failures: the dashboard warns when the li
   "manifest": "sites/example.com/snapshots/20260901-140000/manifest.json",
   "host": "example.com",
   "updated_at": "2026-09-01T14:07:12+00:00",
+  "revision": "9f2c41d07ab3e655",
   "counts": { "pages": 812, "assets": 1930, "redirects": 4, "private": 3, "bytes": 412331021 },
   "generator": "lifeboat/1.0.0"
 }
 ```
 
-Full builds create a new versioned prefix and atomically promote it by writing `current.json` last. Incremental updates instead mutate the current prefix in place, then rewrite `manifest.json` and `current.json` with the same `snapshot_id` and a new `updated_at`.
+Full builds create a new versioned prefix and atomically promote it by writing `current.json` last. Incremental updates instead mutate the current prefix in place, then rewrite `manifest.json` and `current.json` with the same `snapshot_id`, a new `updated_at` and a new `revision` — also when part of the update failed, so what did change is published.
+
+`manifest.json` and `__404.html` share the key space of site paths, so the Worker never answers `/manifest.json` or `/__404.html` with them; those paths go to WordPress (or get the 404 page during an outage).
 
 ### Key mapping
 
@@ -249,7 +252,7 @@ When an origin redirect resolves to a different snapshot key or another host, th
 - The plugin crawler sends `X-Lifeboat-Crawl: <secret>`. The included Worker treats it as a bypass **only** when its `CRAWL_SECRET` binding is configured and the value matches exactly; an arbitrary or merely present header has no effect. This is only needed when a crawler cannot use a private origin. The per-site secret is generated on activation and can be read with `wp option get lifeboat_settings`.
 - Responses served from the snapshot must carry `X-Lifeboat: <snapshot_id>`. The crawler aborts a build if it sees this header, which prevents snapshotting the snapshot — in edge mode as much as during an outage, which is why the crawler needs a private origin address.
 - The included Worker adds `X-Lifeboat-Route: edge` (served from the snapshot by policy) or `fallback` (served because the origin failed).
-- Requests the Worker forwards carry `X-Forwarded-Host`/`X-Forwarded-Proto`, and, when the site has an edge secret, `X-Lifeboat-Edge: <secret>` and `X-Lifeboat-Client-IP: <CF-Connecting-IP>`. The Worker strips client-supplied copies of both.
+- Requests the Worker forwards carry `X-Forwarded-Host`/`X-Forwarded-Proto`, and, when the site has an edge secret, `X-Lifeboat-Edge: <secret>` and `X-Lifeboat-Client-IP: <CF-Connecting-IP>`. The Worker strips client-supplied copies of all four in every spelling, including underscores (`X_Lifeboat_Client_IP`), which PHP maps to the same `$_SERVER` key.
 - Health endpoint: `GET /wp-json/lifeboat/v1/health` returns 200 (`{"ok":true,...}`) or 503, with `Cache-Control: no-store`. `/wp-json/*` is pass-through in the Worker.
 
 ### Included Worker behaviour

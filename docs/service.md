@@ -93,7 +93,8 @@ exist), 403 key outside the prefix, 404, 405, 411, 413.
 - A key authenticates exactly one canonical site. Alias records, sites without
   `ingestKeySha256` and the `workers.dev` bootstrap host can never ingest.
 - Every key a request names is confined to that site's prefix, without empty,
-  `.` or `..` segments or control characters.
+  `.` or `..` segments or control characters. The fleet compiler refuses
+  prefixes that nest inside one another, so no site's prefix contains another's.
 - The edge validates every promoted pointer: `current.json` must name the
   site's own host and its own `<prefix>/snapshots/<id>`, so even a site that
   writes a malicious pointer cannot make the edge serve another site's objects.

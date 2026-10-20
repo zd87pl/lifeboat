@@ -164,28 +164,31 @@ final class Plugin {
 
 	/** A new comment that is visible right away (auto-approved) changes its post's page. */
 	public function on_comment_posted( int $comment_id, $approved ): void {
-		if ( 1 === (int) $approved ) {
-			$this->refresh_comment_post( $comment_id );
+		$comment = get_comment( $comment_id );
+		if ( $comment && 1 === (int) $approved ) {
+			$this->refresh_comment_post( (int) $comment->comment_post_ID );
 		}
 	}
 
-	/** Approving, unapproving, spamming, trashing or deleting a visible comment changes its post's page. */
+	/**
+	 * Approving, unapproving, spamming, trashing or deleting a visible comment changes its post's page.
+	 * Uses the comment object the hook passes: after a permanent delete the row is already gone.
+	 */
 	public function on_comment_status( $new_status, $old_status, $comment ): void {
 		if ( 'approved' === $new_status || 'approved' === $old_status ) {
-			$this->refresh_comment_post( (int) $comment->comment_ID );
+			$this->refresh_comment_post( (int) $comment->comment_post_ID );
 		}
 	}
 
 	public function on_comment_edited( int $comment_id ): void {
 		$comment = get_comment( $comment_id );
 		if ( $comment && '1' === (string) $comment->comment_approved ) {
-			$this->refresh_comment_post( $comment_id );
+			$this->refresh_comment_post( (int) $comment->comment_post_ID );
 		}
 	}
 
-	private function refresh_comment_post( int $comment_id ): void {
-		$comment = get_comment( $comment_id );
-		$post    = $comment ? get_post( (int) $comment->comment_post_ID ) : null;
+	private function refresh_comment_post( int $post_id ): void {
+		$post = get_post( $post_id );
 		if ( ! $post || 'publish' !== $post->post_status || ! is_post_type_viewable( $post->post_type ) ) {
 			return;
 		}

@@ -65,7 +65,9 @@ For an initial 100-site rollout:
   through the same Worker. It may differ from the plugin's private
   `LIFEBOAT_ORIGIN_URL` crawl address.
 - `prefix` is optional and defaults to `sites/<canonicalHost>`. Prefixes must be
-  unique so two sites cannot overwrite one another's snapshots. The plugin's
+  unique and must not nest (`sites/a` next to `sites/a/shop` is refused), so two
+  sites cannot overwrite one another's snapshots: a site's ingest key may write
+  anything under its own prefix. The plugin's
   `LIFEBOAT_PREFIX`, this value, and the Worker's R2 bucket binding must describe
   the same bucket/key location or fallback fails closed.
 - `aliases` is optional. Each alias gets its own KV record with `canonicalHost`
