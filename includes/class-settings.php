@@ -15,9 +15,15 @@ final class Settings {
 		'r2_secret_access_key' => 'LIFEBOAT_R2_SECRET_ACCESS_KEY',
 		'origin_url'           => 'LIFEBOAT_ORIGIN_URL',
 		'prefix'               => 'LIFEBOAT_PREFIX',
+		'service_url'          => 'LIFEBOAT_SERVICE_URL',
+		'service_key'          => 'LIFEBOAT_SERVICE_KEY',
+		'edge_secret'          => 'LIFEBOAT_EDGE_SECRET',
 	];
 
-	public const CHECKBOXES = [ 'origin_ssl_verify', 'use_wp_cron', 'incremental' ];
+	public const CHECKBOXES = [ 'origin_ssl_verify', 'use_wp_cron', 'incremental', 'trust_edge_host' ];
+
+	/** Settings whose stored value is kept when the form field is left blank. */
+	public const SECRETS = [ 'r2_secret_access_key', 'service_key', 'edge_secret' ];
 
 	/** Paths matching any of these (PCRE, no delimiters, matched against the decoded path) are never crawled. */
 	public const DEFAULT_EXCLUDES = [
@@ -41,6 +47,10 @@ final class Settings {
 			'r2_access_key_id'     => '',
 			'r2_secret_access_key' => '',
 			'prefix'               => '',      // defaults to sites/<host>
+			'service_url'          => '',      // hosted Lifeboat ingest endpoint; replaces the R2 credentials
+			'service_key'          => '',
+			'edge_secret'          => '',      // shared with the Worker (SITES record edgeSecret)
+			'trust_edge_host'      => 1,       // accept the edge's X-Forwarded-Host when it names this site
 			'origin_url'           => '',      // loopback base, e.g. https://127.0.0.1 — strongly recommended
 			'origin_ssl_verify'    => 0,
 			'schedule_hours'       => 6,       // 0 disables the WP-Cron schedule
@@ -80,6 +90,20 @@ final class Settings {
 	public static function r2_ready(): bool {
 		$s = self::all();
 		return '' !== $s['r2_account_id'] && '' !== $s['r2_bucket'] && '' !== $s['r2_access_key_id'] && '' !== $s['r2_secret_access_key'];
+	}
+
+	public static function service_ready(): bool {
+		$s = self::all();
+		return '' !== $s['service_url'] && '' !== $s['service_key'];
+	}
+
+	public static function storage_ready(): bool {
+		return self::service_ready() || self::r2_ready();
+	}
+
+	/** Where snapshots go: the hosted Lifeboat service when connected, otherwise your own R2 bucket. */
+	public static function storage(): ?Storage_Client {
+		return Service_Client::from_settings() ?? R2_Client::from_settings();
 	}
 
 	/** Lower-cased host of the site, e.g. example.com */

@@ -7,7 +7,9 @@ use WP_Error;
  * Minimal S3-compatible client for Cloudflare R2 (SigV4, path-style, region "auto").
  * No SDK dependency; uses the WordPress HTTP API.
  */
-final class R2_Client {
+final class R2_Client implements Storage_Client {
+
+	use Storage_Helpers;
 
 	private string $host;
 	private string $endpoint;
@@ -44,9 +46,21 @@ final class R2_Client {
 		return $this->bucket;
 	}
 
+	public function label(): string {
+		return 'Cloudflare R2 bucket ' . $this->bucket;
+	}
+
+	public function check( string $prefix ): string|WP_Error {
+		$r = $this->probe_roundtrip( $prefix );
+		return is_wp_error( $r ) ? $r : sprintf( 'R2 write/read/delete OK on bucket %s under %s/.', $this->bucket, $prefix );
+	}
+
 	/** @param array<string,string> $meta stored as x-amz-meta-* (ASCII only; non-ASCII is percent-encoded). */
-	public function put( string $key, string $body, string $content_type, array $meta = [] ): true|WP_Error {
+	public function put( string $key, string $body, string $content_type, array $meta = [], string $cache_control = '' ): bool|WP_Error {
 		$headers = [ 'Content-Type' => $content_type ];
+		if ( '' !== $cache_control ) {
+			$headers['Cache-Control'] = $cache_control;
+		}
 		foreach ( $meta as $k => $v ) {
 			$headers[ 'x-amz-meta-' . $k ] = self::ascii( (string) $v );
 		}
@@ -59,21 +73,12 @@ final class R2_Client {
 		return is_wp_error( $r ) ? $r : $r['body'];
 	}
 
-	public function get_json( string $key ): array|WP_Error {
-		$b = $this->get( $key );
-		if ( is_wp_error( $b ) ) {
-			return $b;
-		}
-		$d = json_decode( $b, true );
-		return is_array( $d ) ? $d : new WP_Error( 'r2_bad_json', "Object $key is not valid JSON." );
-	}
-
 	public function exists( string $key ): bool {
 		return ! is_wp_error( $this->request( 'HEAD', $key ) );
 	}
 
 	/** Server-side copy within the bucket (no re-upload). */
-	public function copy( string $src_key, string $dst_key ): true|WP_Error {
+	public function copy( string $src_key, string $dst_key ): bool|WP_Error {
 		$r = $this->request(
 			'PUT',
 			$dst_key,
@@ -84,7 +89,7 @@ final class R2_Client {
 		return is_wp_error( $r ) ? $r : true;
 	}
 
-	public function delete( string $key ): true|WP_Error {
+	public function delete( string $key ): bool|WP_Error {
 		$r = $this->request( 'DELETE', $key );
 		if ( is_wp_error( $r ) && 'not_found' === $r->get_error_code() ) {
 			return true;
@@ -93,7 +98,7 @@ final class R2_Client {
 	}
 
 	/** Multi-object delete, 1000 keys per request. */
-	public function delete_many( array $keys ): true|WP_Error {
+	public function delete_many( array $keys ): bool|WP_Error {
 		foreach ( array_chunk( array_values( $keys ), 1000 ) as $chunk ) {
 			$xml = '<?xml version="1.0" encoding="UTF-8"?><Delete><Quiet>true</Quiet>';
 			foreach ( $chunk as $k ) {
@@ -170,38 +175,6 @@ final class R2_Client {
 		return $out;
 	}
 
-	/** @return string[]|WP_Error all keys under $prefix (capped at 250k). */
-	public function list_all_keys( string $prefix ): array|WP_Error {
-		$keys  = [];
-		$token = null;
-		do {
-			$page = $this->list( $prefix, '', $token );
-			if ( is_wp_error( $page ) ) {
-				return $page;
-			}
-			foreach ( $page['keys'] as $k ) {
-				$keys[] = $k['key'];
-			}
-			$token = $page['next'];
-		} while ( null !== $token && count( $keys ) < 250000 );
-		return $keys;
-	}
-
-	/** @return string[]|WP_Error immediate "sub-directories" under $prefix (which must end with "/"). */
-	public function list_prefixes( string $prefix ): array|WP_Error {
-		$prefixes = [];
-		$token    = null;
-		do {
-			$page = $this->list( $prefix, '/', $token );
-			if ( is_wp_error( $page ) ) {
-				return $page;
-			}
-			$prefixes = array_merge( $prefixes, $page['prefixes'] );
-			$token    = $page['next'];
-		} while ( null !== $token );
-		return $prefixes;
-	}
-
 	/**
 	 * AWS Signature Version 4 for S3. Returns the headers to send (input headers + auth headers)
 	 * and the query string pairs to append to the URL.
@@ -262,10 +235,6 @@ final class R2_Client {
 
 	private static function xml_text( string $xml, string $tag ): string {
 		return preg_match( "#<$tag>(.*?)</$tag>#s", $xml, $m ) ? html_entity_decode( trim( $m[1] ), ENT_QUOTES | ENT_XML1, 'UTF-8' ) : '';
-	}
-
-	private static function ascii( string $v ): string {
-		return preg_replace_callback( '/[^\x21-\x7E]/', static fn( $m ) => rawurlencode( $m[0] ), $v );
 	}
 
 	/**
